@@ -45,6 +45,8 @@ import time
 
 import pyperclip
 
+__version__ = "0.1"
+
 # ----------------------------- configuration ------------------------------ #
 CLIP_PORT = 32620          # TCP port for clipboard transfer (binds 0.0.0.0)
 DISCOVERY_PORT = 54321      # UDP port for LAN broadcast discovery
@@ -405,6 +407,7 @@ class PeerNet:
 
     # -- lifecycle -------------------------------------------------------- #
     def start(self):
+        print(f"[*] clipshare v{__version__}")
         print(f"[*] Local IP: {self.my_ip}  TCP port: {self.port}")
         if self.peers:
             print(f"[*] Explicit peers: {', '.join(sorted(self.peers))}")
@@ -428,6 +431,8 @@ def main():
     parser.add_argument("--password", "-P", default=os.environ.get("CLIPSHARE_PASSWORD"),
                         help="Connection password (same on all nodes). "
                              "May also be set via CLIPSHARE_PASSWORD env var.")
+    parser.add_argument("--version", action="version",
+                        version=f"clipshare {__version__}")
     args = parser.parse_args()
 
     peers = []
