@@ -81,6 +81,43 @@ Notes:
 - The receiver sanitizes the file name (keeping only the base name) so a peer
   cannot write outside the receive directory.
 
+## Copy & paste files (file-level clipboard)
+
+clipshare can also sync **files copied in your file manager**: copy a file
+(Ctrl+C) on one machine and paste it (Ctrl+V) on another.
+
+- This is **on by default**, no extra flags needed. When you copy a file on one
+  machine, it is sent to all peers; each peer saves it into the receive
+  directory and **puts it back on its own clipboard**, so you can paste it
+  straight into the file manager with Ctrl+V.
+- `--no-file-clip`: disable copy/paste file syncing (clipboard text still syncs).
+
+```bash
+# Enabled by default, just run it
+python clipshare.py
+
+# To turn it off
+python clipshare.py --no-file-clip
+```
+
+Platform support:
+
+- **Windows**: native (CF_HDROP).
+- **Linux X11**: requires `xclip`.
+- **Linux Wayland**: requires `wl-clipboard` (`wl-copy` / `wl-paste`).
+- If the backend is missing, the feature is disabled automatically (text sync
+  still works); the current status is printed at startup.
+
+Notes:
+
+- Copied files share the same 2 GiB total cap and travel over the same
+  authenticated channel.
+- Received files are saved to the receive directory (see `--recv-dir` above)
+  first, then placed on the clipboard; name clashes are auto-renamed to avoid
+  overwriting.
+- Loop protection is built in: files a peer pushed onto your clipboard are not
+  echoed back.
+
 ## How it works
 
 - Each node runs a TCP server (receives updates) and a TCP client per peer

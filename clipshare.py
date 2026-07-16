@@ -24,6 +24,8 @@ Usage
     CLIPSHARE_PASSWORD=secret python clipshare.py        # password via env
     python clipshare.py --send-file ./report.pdf         # also share a single file
     python clipshare.py --recv-dir ./inbox               # where received files land
+    # Copy a file in your file manager -> it is mirrored to peers, ready to paste.
+    python clipshare.py --no-file-clip                   # disable copy/paste of files
 
 The TCP server binds to 0.0.0.0 on port 32620 by default. When a password is
 set (via --password or CLIPSHARE_PASSWORD) every connection must authenticate
@@ -42,12 +44,16 @@ import hashlib
 import os
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
+import urllib.parse
+from shutil import which
 
 import pyperclip
 
-__version__ = "0.2"
+__version__ = "0.3"
 
 # ----------------------------- configuration ------------------------------ #
 CLIP_PORT = 32620          # TCP port for clipboard transfer (binds 0.0.0.0)
@@ -63,9 +69,11 @@ HEADER = b"CS1"            # 3-byte magic marking a framed message
 TYPE_AUTH = 0x01           # payload = SHA-256(password)
 TYPE_CLIP = 0x02           # payload = clipboard text (utf-8)
 TYPE_FILE = 0x03           # payload = NAMELEN(2) + name(utf-8) + file bytes
+TYPE_CLIPFILES = 0x04      # payload = COUNT(2) + [NAMELEN(2)+name+DATALEN(8)+data]*
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB safety cap for a single file
 DEFAULT_RECV_DIR = "clipshare_recv"     # where received files are stored
 SEND_FILE_WAIT = 15.0      # seconds to wait for a peer before sending a file
+FILE_POLL_INTERVAL = 1.0   # seconds between "copied files" clipboard polls
 
 # ------------------------------- globals ---------------------------------- #
 _running = threading.Event()
@@ -190,6 +198,255 @@ def recv_frame(conn):
     return ftype, payload
 
 
+# --------------------------- file clipboard ------------------------------- #
+class FileClipboard:
+    """Detect files copied to the OS clipboard and place received files back
+    onto it, so a "copy file" on one machine becomes a "paste" (Ctrl+V) on
+    another.
+
+    Cross-platform, best effort:
+      - Windows : native CF_HDROP via ctypes.
+      - Linux   : xclip (X11) / wl-clipboard (Wayland) using the
+                  'x-special/gnome-copied-files' and 'text/uri-list' targets.
+    On unsupported systems every method degrades to a harmless no-op.
+    """
+
+    def __init__(self):
+        self.backend = self._detect_backend()
+
+    @property
+    def available(self):
+        return self.backend is not None
+
+    def describe(self):
+        return {
+            "windows": "Windows native (CF_HDROP)",
+            "x11": "Linux X11 (xclip)",
+            "wayland": "Linux Wayland (wl-clipboard)",
+        }.get(self.backend, "unavailable on this system")
+
+    # -- backend detection ----------------------------------------------- #
+    @staticmethod
+    def _detect_backend():
+        if sys.platform == "win32":
+            return "windows"
+        if sys.platform.startswith("linux"):
+            wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+            if wayland and which("wl-paste") and which("wl-copy"):
+                return "wayland"
+            if which("xclip"):
+                return "x11"
+            if wayland and which("wl-paste"):
+                return "wayland"
+        return None
+
+    # -- read: files currently copied ------------------------------------ #
+    def get_files(self):
+        """Return a list of existing local file paths currently on the
+        clipboard, or None if there are none / it is unsupported."""
+        try:
+            if self.backend == "windows":
+                paths = self._win_get_files()
+            elif self.backend == "x11":
+                paths = self._uris_to_paths(self._xclip_get())
+            elif self.backend == "wayland":
+                paths = self._uris_to_paths(self._wl_get())
+            else:
+                return None
+        except Exception:
+            return None
+        files = [p for p in (paths or []) if os.path.isfile(p)]
+        return files or None
+
+    # -- write: put files on the clipboard ------------------------------- #
+    def set_files(self, paths):
+        paths = [os.path.abspath(p) for p in paths if os.path.isfile(p)]
+        if not paths:
+            return False
+        try:
+            if self.backend == "windows":
+                return self._win_set_files(paths)
+            if self.backend == "x11":
+                return self._xclip_set(paths)
+            if self.backend == "wayland":
+                return self._wl_set(paths)
+        except Exception:
+            return False
+        return False
+
+    # -- uri <-> path helpers -------------------------------------------- #
+    @staticmethod
+    def _uris_to_paths(text):
+        if not text:
+            return []
+        paths = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line in ("copy", "cut"):
+                continue
+            if line.startswith("file://"):
+                p = urllib.parse.unquote(urllib.parse.urlparse(line).path)
+            elif line.startswith("/"):
+                p = line
+            else:
+                continue
+            # Normalize so an accidental "///" (or other odd producer) does
+            # not make the path differ from the one we computed locally -
+            # this keeps loop-prevention signatures consistent.
+            p = os.path.normpath(p)
+            paths.append(p)
+        return paths
+
+    @staticmethod
+    def _paths_to_gnome(paths, action="copy"):
+        lines = [action]
+        for p in paths:
+            # RFC 8089 file URI: file:///absolute/path (exactly three slashes).
+            lines.append("file://" + urllib.parse.quote(os.path.abspath(p)))
+        return "\n".join(lines) + "\n"
+
+    # -- Linux X11 (xclip) ------------------------------------------------ #
+    @staticmethod
+    def _xclip_get():
+        for target in ("x-special/gnome-copied-files", "text/uri-list"):
+            try:
+                out = subprocess.run(
+                    ["xclip", "-selection", "clipboard", "-t", target, "-o"],
+                    capture_output=True, timeout=5)
+            except Exception:
+                continue
+            if out.returncode == 0 and out.stdout:
+                return out.stdout.decode("utf-8", "replace")
+        return ""
+
+    def _xclip_set(self, paths):
+        data = self._paths_to_gnome(paths).encode("utf-8")
+        try:
+            subprocess.run(
+                ["xclip", "-selection", "clipboard",
+                 "-t", "x-special/gnome-copied-files"],
+                input=data, timeout=5, check=False)
+            return True
+        except Exception:
+            return False
+
+    # -- Linux Wayland (wl-clipboard) ------------------------------------ #
+    @staticmethod
+    def _wl_get():
+        for target in ("x-special/gnome-copied-files", "text/uri-list"):
+            try:
+                out = subprocess.run(
+                    ["wl-paste", "-t", target],
+                    capture_output=True, timeout=5)
+            except Exception:
+                continue
+            if out.returncode == 0 and out.stdout:
+                return out.stdout.decode("utf-8", "replace")
+        return ""
+
+    def _wl_set(self, paths):
+        data = self._paths_to_gnome(paths).encode("utf-8")
+        try:
+            subprocess.run(
+                ["wl-copy", "-t", "x-special/gnome-copied-files"],
+                input=data, timeout=5, check=False)
+            return True
+        except Exception:
+            return False
+
+    # -- Windows (CF_HDROP via ctypes) ----------------------------------- #
+    @staticmethod
+    def _win_get_files():
+        import ctypes
+        from ctypes import wintypes
+
+        CF_HDROP = 15
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+        shell32.DragQueryFileW.argtypes = [
+            wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        user32.GetClipboardData.restype = wintypes.HANDLE
+
+        if not user32.OpenClipboard(None):
+            return []
+        try:
+            if not user32.IsClipboardFormatAvailable(CF_HDROP):
+                return []
+            handle = user32.GetClipboardData(CF_HDROP)
+            if not handle:
+                return []
+            count = shell32.DragQueryFileW(handle, 0xFFFFFFFF, None, 0)
+            files = []
+            for i in range(count):
+                need = shell32.DragQueryFileW(handle, i, None, 0)
+                buf = ctypes.create_unicode_buffer(need + 1)
+                shell32.DragQueryFileW(handle, i, buf, need + 1)
+                files.append(buf.value)
+            return files
+        finally:
+            user32.CloseClipboard()
+
+    @staticmethod
+    def _win_set_files(paths):
+        import ctypes
+        from ctypes import wintypes
+
+        CF_HDROP = 15
+        GMEM_MOVEABLE = 0x0002
+
+        class DROPFILES(ctypes.Structure):
+            _fields_ = [
+                ("pFiles", wintypes.DWORD),
+                ("pt", wintypes.POINT),
+                ("fNC", wintypes.BOOL),
+                ("fWide", wintypes.BOOL),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+
+        files_str = "".join(p + "\0" for p in paths) + "\0"
+        files_bytes = files_str.encode("utf-16-le")
+        df = DROPFILES()
+        df.pFiles = ctypes.sizeof(DROPFILES)
+        df.fWide = True
+        total = ctypes.sizeof(DROPFILES) + len(files_bytes)
+
+        h_global = kernel32.GlobalAlloc(GMEM_MOVEABLE, total)
+        if not h_global:
+            return False
+        ptr = kernel32.GlobalLock(h_global)
+        if not ptr:
+            kernel32.GlobalFree(h_global)
+            return False
+        try:
+            ctypes.memmove(ptr, ctypes.byref(df), ctypes.sizeof(DROPFILES))
+            ctypes.memmove(ptr + ctypes.sizeof(DROPFILES),
+                           files_bytes, len(files_bytes))
+        finally:
+            kernel32.GlobalUnlock(h_global)
+
+        if not user32.OpenClipboard(None):
+            kernel32.GlobalFree(h_global)
+            return False
+        try:
+            user32.EmptyClipboard()
+            if not user32.SetClipboardData(CF_HDROP, h_global):
+                kernel32.GlobalFree(h_global)
+                return False
+            # Ownership passed to the clipboard; must NOT free h_global now.
+            return True
+        finally:
+            user32.CloseClipboard()
+
+
 # ------------------------------ peer network ------------------------------ #
 class PeerNet:
     def __init__(self, port, peers, clip, password=None, recv_dir=DEFAULT_RECV_DIR):
@@ -197,6 +454,9 @@ class PeerNet:
         self.peers = set(peers) if peers else set()  # empty => accept any (auto mode)
         self.clip = clip
         self.recv_dir = recv_dir
+        self.file_clip = None            # optional FileClipboard (set by main)
+        self._clipfile_lock = threading.Lock()
+        self.last_recv_clip_sig = None   # sig of files we just placed on clipboard
         # SHA-256 of the password; None means "open" (no auth required).
         self._pw_hash = (hashlib.sha256(password.encode("utf-8")).digest()
                          if password else None)
@@ -388,6 +648,8 @@ class PeerNet:
                     print(f"[<] Clipboard updated from {peer_ip}")
                 elif ftype == TYPE_FILE:
                     self._save_file(payload, peer_ip)
+                elif ftype == TYPE_CLIPFILES:
+                    self._save_clip_files(payload, peer_ip)
                 # Any other type is ignored.
         finally:
             with self._lock:
@@ -473,23 +735,122 @@ class PeerNet:
         name_len = struct.unpack(">H", payload[:2])[0]
         name = payload[2:2 + name_len].decode("utf-8", "replace")
         data = payload[2 + name_len:]
-        # Sanitize the name so a peer can't write outside the recv dir.
+        dest = self._write_recv_file(name, data, peer_ip)
+        if dest:
+            print(f"[<] Received file {os.path.basename(dest)!r} "
+                  f"({len(data)} bytes) from {peer_ip} -> {dest}")
+
+    def _write_recv_file(self, name, data, peer_ip):
+        """Write one received file into recv_dir; return the path or None.
+        The name is sanitized so a peer cannot escape the receive directory."""
         safe_name = os.path.basename(name) or "received.bin"
         try:
             os.makedirs(self.recv_dir, exist_ok=True)
         except OSError as e:
             print(f"[!] Cannot create recv dir {self.recv_dir!r}: {e}")
-            return
-        dest = os.path.join(self.recv_dir, safe_name)
-        dest = self._unique_path(dest)
+            return None
+        dest = self._unique_path(os.path.join(self.recv_dir, safe_name))
         try:
             with open(dest, "wb") as f:
                 f.write(data)
         except OSError as e:
             print(f"[!] Failed to save file from {peer_ip}: {e}")
+            return None
+        return dest
+
+    # -- copy/paste of files (OS clipboard) ------------------------------ #
+    @staticmethod
+    def _files_sig(paths):
+        return tuple(sorted(os.path.abspath(p) for p in paths))
+
+    def mark_clip_files(self, paths):
+        """Record files we just put on the local clipboard, so the poller
+        does not treat them as a fresh local copy and echo them back."""
+        with self._clipfile_lock:
+            self.last_recv_clip_sig = self._files_sig(paths)
+
+    def recv_clip_sig(self):
+        with self._clipfile_lock:
+            return self.last_recv_clip_sig
+
+    def send_clip_files(self, paths):
+        """Send the given copied files to all peers as a single frame.
+        Returns the number of peers it reached."""
+        blobs, total = [], 0
+        for p in paths:
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                continue
+            total += size
+            if total > MAX_FILE_SIZE:
+                print(f"[!] Copied files exceed {MAX_FILE_SIZE} bytes; "
+                      f"not sending.")
+                return 0
+            try:
+                with open(p, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            blobs.append((os.path.basename(p).encode("utf-8"), data))
+        if not blobs:
+            return 0
+
+        parts = [struct.pack(">H", len(blobs))]
+        for name, data in blobs:
+            parts.append(struct.pack(">H", len(name)))
+            parts.append(name)
+            parts.append(struct.pack(">Q", len(data)))
+            parts.append(data)
+        frame = build_frame(TYPE_CLIPFILES, b"".join(parts))
+
+        with self._lock:
+            peers = list(self.connections.items())
+        if not peers:
+            return 0
+        sent = 0
+        for _, sock in peers:
+            try:
+                sock.sendall(frame)
+                sent += 1
+            except Exception:
+                pass
+        names = ", ".join(n.decode("utf-8", "replace") for n, _ in blobs)
+        print(f"[>] Sent {len(blobs)} copied file(s) [{names}] "
+              f"to {sent} peer(s)")
+        return sent
+
+    def _save_clip_files(self, payload, peer_ip):
+        saved = []
+        try:
+            off = 0
+            count = struct.unpack_from(">H", payload, off)[0]
+            off += 2
+            for _ in range(count):
+                name_len = struct.unpack_from(">H", payload, off)[0]
+                off += 2
+                name = payload[off:off + name_len].decode("utf-8", "replace")
+                off += name_len
+                data_len = struct.unpack_from(">Q", payload, off)[0]
+                off += 8
+                data = payload[off:off + data_len]
+                off += data_len
+                dest = self._write_recv_file(name, data, peer_ip)
+                if dest:
+                    saved.append(dest)
+        except Exception as e:
+            print(f"[!] Malformed copied-files frame from {peer_ip}: {e}")
             return
-        print(f"[<] Received file {safe_name!r} ({len(data)} bytes) "
-              f"from {peer_ip} -> {dest}")
+        if not saved:
+            return
+        print(f"[<] Received {len(saved)} copied file(s) from {peer_ip} "
+              f"-> {self.recv_dir}")
+        # Put them on our clipboard so they can be pasted straight away.
+        if self.file_clip and self.file_clip.available:
+            if self.file_clip.set_files(saved):
+                self.mark_clip_files(saved)
+                print("[*] Files placed on clipboard - paste (Ctrl+V) "
+                      "in your file manager to use them.")
 
     @staticmethod
     def _unique_path(path):
@@ -536,6 +897,10 @@ def main():
     parser.add_argument("--recv-dir", default=DEFAULT_RECV_DIR, metavar="DIR",
                         help=f"Directory to store received files "
                              f"(default: {DEFAULT_RECV_DIR}).")
+    parser.add_argument("--no-file-clip", action="store_true",
+                        help="Disable copy/paste file syncing (copying files "
+                             "in the file manager is otherwise mirrored to "
+                             "peers, ready to paste).")
     parser.add_argument("--version", action="version",
                         version=f"clipshare {__version__}")
     args = parser.parse_args()
@@ -550,6 +915,12 @@ def main():
     clip = Clipboard()
     net = PeerNet(args.port, peers, clip, password=args.password,
                   recv_dir=args.recv_dir)
+
+    file_clip = None
+    if not args.no_file_clip:
+        file_clip = FileClipboard()
+        net.file_clip = file_clip
+
     net.start()
 
     if args.send_file:
@@ -558,12 +929,34 @@ def main():
                          args=(args.send_file,), daemon=True).start()
 
     print(f"[*] Receiving files into: {os.path.abspath(args.recv_dir)}")
+    if file_clip and file_clip.available:
+        print(f"[*] Copy/paste file sync: on ({file_clip.describe()})")
+    elif args.no_file_clip:
+        print("[*] Copy/paste file sync: off (--no-file-clip)")
+    else:
+        print("[*] Copy/paste file sync: unavailable on this system "
+              "(text still syncs)")
     print("[*] Watching clipboard. Copy something to share it. Ctrl+C to quit.")
+
+    last_clip_files_sig = None
+    next_file_poll = 0.0
     try:
         while _running.is_set():
             changed = clip.poll_changed()
             if changed is not None:
                 net.broadcast(changed)
+
+            if file_clip and file_clip.available and time.time() >= next_file_poll:
+                next_file_poll = time.time() + FILE_POLL_INTERVAL
+                files = file_clip.get_files()
+                if files:
+                    sig = PeerNet._files_sig(files)
+                    # Skip if unchanged, or if these are files a peer just
+                    # pushed onto our clipboard (avoid echoing them back).
+                    if sig != last_clip_files_sig and sig != net.recv_clip_sig():
+                        last_clip_files_sig = sig
+                        net.send_clip_files(files)
+
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
         pass
