@@ -52,6 +52,35 @@ python clipshare.py --password yourSecret --peer 192.168.1.40 --peer 192.168.1.5
 # (comma form also works: --peer 192.168.1.50,192.168.1.60)
 ```
 
+## File transfer
+
+Besides syncing clipboard text, clipshare can also send a **single file** to all
+connected peers.
+
+- `--send-file <path>` / `-f <path>`: after startup, wait for a peer to connect,
+  then send that file to all connected peers and keep running normally (clipboard
+  sync continues).
+- `--recv-dir <dir>`: directory where received files are stored (default
+  `clipshare_recv`). It is created automatically if missing; if a file with the
+  same name already exists, it is renamed to `name (1).ext`, `name (2).ext`, etc.
+  to avoid overwriting.
+
+```bash
+# Send a file (waits up to ~15s after startup for a peer to connect)
+python clipshare.py --send-file ./report.pdf
+
+# Choose where received files land
+python clipshare.py --recv-dir ./inbox
+```
+
+Notes:
+
+- A single file is capped at 2 GiB.
+- Files travel over the same authenticated channel as the clipboard; when a
+  password is set, transfers must authenticate too.
+- The receiver sanitizes the file name (keeping only the base name) so a peer
+  cannot write outside the receive directory.
+
 ## How it works
 
 - Each node runs a TCP server (receives updates) and a TCP client per peer

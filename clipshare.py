@@ -22,6 +22,8 @@ Usage
     python clipshare.py --peer 192.168.1.50              # connect to a peer
     python clipshare.py --port 32620 --password secret   # custom port + auth
     CLIPSHARE_PASSWORD=secret python clipshare.py        # password via env
+    python clipshare.py --send-file ./report.pdf         # also share a single file
+    python clipshare.py --recv-dir ./inbox               # where received files land
 
 The TCP server binds to 0.0.0.0 on port 32620 by default. When a password is
 set (via --password or CLIPSHARE_PASSWORD) every connection must authenticate
@@ -45,7 +47,7 @@ import time
 
 import pyperclip
 
-__version__ = "0.1"
+__version__ = "0.2"
 
 # ----------------------------- configuration ------------------------------ #
 CLIP_PORT = 32620          # TCP port for clipboard transfer (binds 0.0.0.0)
@@ -60,6 +62,10 @@ ACCEPT_COOLDOWN = RECONNECT_INTERVAL  # ignore re-connects from a peer that just
 HEADER = b"CS1"            # 3-byte magic marking a framed message
 TYPE_AUTH = 0x01           # payload = SHA-256(password)
 TYPE_CLIP = 0x02           # payload = clipboard text (utf-8)
+TYPE_FILE = 0x03           # payload = NAMELEN(2) + name(utf-8) + file bytes
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB safety cap for a single file
+DEFAULT_RECV_DIR = "clipshare_recv"     # where received files are stored
+SEND_FILE_WAIT = 15.0      # seconds to wait for a peer before sending a file
 
 # ------------------------------- globals ---------------------------------- #
 _running = threading.Event()
@@ -186,10 +192,11 @@ def recv_frame(conn):
 
 # ------------------------------ peer network ------------------------------ #
 class PeerNet:
-    def __init__(self, port, peers, clip, password=None):
+    def __init__(self, port, peers, clip, password=None, recv_dir=DEFAULT_RECV_DIR):
         self.port = port
         self.peers = set(peers) if peers else set()  # empty => accept any (auto mode)
         self.clip = clip
+        self.recv_dir = recv_dir
         # SHA-256 of the password; None means "open" (no auth required).
         self._pw_hash = (hashlib.sha256(password.encode("utf-8")).digest()
                          if password else None)
@@ -379,6 +386,8 @@ class PeerNet:
                     text = payload.decode("utf-8", "replace")
                     self.clip.set(text)
                     print(f"[<] Clipboard updated from {peer_ip}")
+                elif ftype == TYPE_FILE:
+                    self._save_file(payload, peer_ip)
                 # Any other type is ignored.
         finally:
             with self._lock:
@@ -404,6 +413,96 @@ class PeerNet:
                 # The reader thread will clean up the dead socket.
                 pass
         print(f"[>] Sent clipboard to {len(peers)} peer(s)")
+
+    # -- single-file transfer -------------------------------------------- #
+    def send_file(self, path):
+        """Send a single file to all connected peers. Returns the number of
+        peers it was sent to (0 if none, or on error)."""
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            print(f"[!] Cannot read file {path!r}: {e}")
+            return 0
+        if size > MAX_FILE_SIZE:
+            print(f"[!] File too large ({size} bytes > {MAX_FILE_SIZE}); aborting.")
+            return 0
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            print(f"[!] Cannot read file {path!r}: {e}")
+            return 0
+
+        name = os.path.basename(path).encode("utf-8")
+        payload = struct.pack(">H", len(name)) + name + data
+        frame = build_frame(TYPE_FILE, payload)
+
+        with self._lock:
+            peers = list(self.connections.items())
+        if not peers:
+            print(f"[!] No peers connected; file {path!r} was not sent.")
+            return 0
+        sent = 0
+        for _, sock in peers:
+            try:
+                sock.sendall(frame)
+                sent += 1
+            except Exception:
+                pass
+        print(f"[>] Sent file {os.path.basename(path)!r} "
+              f"({size} bytes) to {sent} peer(s)")
+        return sent
+
+    def send_file_when_ready(self, path, wait=SEND_FILE_WAIT):
+        """Wait (up to `wait` seconds) for at least one peer, then send `path`."""
+        deadline = time.time() + wait
+        while _running.is_set() and time.time() < deadline:
+            with self._lock:
+                have_peer = bool(self.connections)
+            if have_peer:
+                # Give the handshake/reader a beat to settle.
+                time.sleep(0.5)
+                break
+            time.sleep(0.3)
+        self.send_file(path)
+
+    def _save_file(self, payload, peer_ip):
+        if len(payload) < 2:
+            print(f"[!] Malformed file frame from {peer_ip}")
+            return
+        name_len = struct.unpack(">H", payload[:2])[0]
+        name = payload[2:2 + name_len].decode("utf-8", "replace")
+        data = payload[2 + name_len:]
+        # Sanitize the name so a peer can't write outside the recv dir.
+        safe_name = os.path.basename(name) or "received.bin"
+        try:
+            os.makedirs(self.recv_dir, exist_ok=True)
+        except OSError as e:
+            print(f"[!] Cannot create recv dir {self.recv_dir!r}: {e}")
+            return
+        dest = os.path.join(self.recv_dir, safe_name)
+        dest = self._unique_path(dest)
+        try:
+            with open(dest, "wb") as f:
+                f.write(data)
+        except OSError as e:
+            print(f"[!] Failed to save file from {peer_ip}: {e}")
+            return
+        print(f"[<] Received file {safe_name!r} ({len(data)} bytes) "
+              f"from {peer_ip} -> {dest}")
+
+    @staticmethod
+    def _unique_path(path):
+        """Avoid overwriting: foo.txt -> foo (1).txt -> foo (2).txt ..."""
+        if not os.path.exists(path):
+            return path
+        base, ext = os.path.splitext(path)
+        i = 1
+        while True:
+            candidate = f"{base} ({i}){ext}"
+            if not os.path.exists(candidate):
+                return candidate
+            i += 1
 
     # -- lifecycle -------------------------------------------------------- #
     def start(self):
@@ -431,18 +530,34 @@ def main():
     parser.add_argument("--password", "-P", default=os.environ.get("CLIPSHARE_PASSWORD"),
                         help="Connection password (same on all nodes). "
                              "May also be set via CLIPSHARE_PASSWORD env var.")
+    parser.add_argument("--send-file", "-f", metavar="PATH",
+                        help="Send a single file to all connected peers shortly "
+                             "after startup, then keep running normally.")
+    parser.add_argument("--recv-dir", default=DEFAULT_RECV_DIR, metavar="DIR",
+                        help=f"Directory to store received files "
+                             f"(default: {DEFAULT_RECV_DIR}).")
     parser.add_argument("--version", action="version",
                         version=f"clipshare {__version__}")
     args = parser.parse_args()
+
+    if args.send_file and not os.path.isfile(args.send_file):
+        raise SystemExit(f"[!] --send-file: not a file: {args.send_file!r}")
 
     peers = []
     for item in args.peer:
         peers.extend(p.strip() for p in item.split(",") if p.strip())
 
     clip = Clipboard()
-    net = PeerNet(args.port, peers, clip, password=args.password)
+    net = PeerNet(args.port, peers, clip, password=args.password,
+                  recv_dir=args.recv_dir)
     net.start()
 
+    if args.send_file:
+        print(f"[*] Will send file once a peer connects: {args.send_file}")
+        threading.Thread(target=net.send_file_when_ready,
+                         args=(args.send_file,), daemon=True).start()
+
+    print(f"[*] Receiving files into: {os.path.abspath(args.recv_dir)}")
     print("[*] Watching clipboard. Copy something to share it. Ctrl+C to quit.")
     try:
         while _running.is_set():
