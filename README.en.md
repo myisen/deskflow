@@ -118,6 +118,43 @@ Notes:
 - Loop protection is built in: files a peer pushed onto your clipboard are not
   echoed back.
 
+## Picture share (clipboard image)
+
+clipshare can also sync **images copied to the clipboard**: copy a picture
+(e.g. a screenshot) on one machine and paste it (Ctrl+V) on another.
+
+- This is **on by default**, no extra flags needed. When you copy a picture it
+  is sent to all peers as a PNG; each peer puts it back on its own clipboard,
+  so you can paste it straight into any image-aware app with Ctrl+V.
+- `--no-image`: disable picture syncing (clipboard text and files still sync).
+
+```bash
+# Enabled by default, just run it
+python clipshare.py
+
+# To turn it off
+python clipshare.py --no-image
+```
+
+Platform support:
+
+- **Windows**: native (CF_DIB; requires Pillow for format conversion).
+- **Linux X11**: requires `xclip`.
+- **Linux Wayland**: requires `wl-clipboard` (`wl-copy` / `wl-paste`).
+- If the backend is missing, received images are automatically saved to the
+  receive directory (see `--recv-dir`) instead of being lost; the current
+  status is printed at startup.
+
+Notes:
+
+- Images travel as PNG over the same authenticated channel, under the same
+  2 GiB cap.
+- While an image sits on the clipboard the text baseline is kept fresh, so the
+  leftover (empty/garbage) text target is not mistaken for a "text change" and
+  echoed to peers.
+- Loop protection is built in: an image a peer pushed onto your clipboard is
+  not echoed back.
+
 ## How it works
 
 - Each node runs a TCP server (receives updates) and a TCP client per peer

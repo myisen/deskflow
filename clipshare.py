@@ -26,6 +26,8 @@ Usage
     python clipshare.py --recv-dir ./inbox               # where received files land
     # Copy a file in your file manager -> it is mirrored to peers, ready to paste.
     python clipshare.py --no-file-clip                   # disable copy/paste of files
+    # Copy a picture (e.g. a screenshot) -> it is mirrored to peers, ready to paste.
+    python clipshare.py --no-image                       # disable picture syncing
 
 The TCP server binds to 0.0.0.0 on port 32620 by default. When a password is
 set (via --password or CLIPSHARE_PASSWORD) every connection must authenticate
@@ -70,10 +72,12 @@ TYPE_AUTH = 0x01           # payload = SHA-256(password)
 TYPE_CLIP = 0x02           # payload = clipboard text (utf-8)
 TYPE_FILE = 0x03           # payload = NAMELEN(2) + name(utf-8) + file bytes
 TYPE_CLIPFILES = 0x04      # payload = COUNT(2) + [NAMELEN(2)+name+DATALEN(8)+data]*
+TYPE_IMAGE = 0x05          # payload = PNG image bytes
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB safety cap for a single file
 DEFAULT_RECV_DIR = "clipshare_recv"     # where received files are stored
 SEND_FILE_WAIT = 15.0      # seconds to wait for a peer before sending a file
 FILE_POLL_INTERVAL = 1.0   # seconds between "copied files" clipboard polls
+IMAGE_POLL_INTERVAL = 0.5  # seconds between "copied image" clipboard polls
 
 # ------------------------------- globals ---------------------------------- #
 _running = threading.Event()
@@ -447,6 +451,244 @@ class FileClipboard:
             user32.CloseClipboard()
 
 
+# --------------------------- image clipboard ------------------------------ #
+class ImageClipboard:
+    """Detect an image (picture) copied to the OS clipboard and place received
+    images back onto it, so a "copy image" (e.g. a screenshot) on one machine
+    becomes a "paste" (Ctrl+V) on another.
+
+    Cross-platform, best effort:
+      - Windows : native CF_DIB via ctypes (requires Pillow to convert).
+      - Linux   : xclip (X11) / wl-clipboard (Wayland) using the
+                  'image/png' target.
+    On unsupported systems (or when Pillow is missing on Windows) every method
+    degrades to a harmless no-op and the image is saved as a PNG in recv_dir
+    instead.
+    """
+
+    def __init__(self):
+        self.backend = self._detect_backend()
+
+    @property
+    def available(self):
+        return self.backend is not None
+
+    def describe(self):
+        return {
+            "windows": "Windows native (CF_DIB)",
+            "x11": "Linux X11 (xclip)",
+            "wayland": "Linux Wayland (wl-clipboard)",
+        }.get(self.backend, "unavailable on this system")
+
+    @staticmethod
+    def _detect_backend():
+        if sys.platform == "win32":
+            return "windows"
+        if sys.platform.startswith("linux"):
+            wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+            if wayland and which("wl-paste") and which("wl-copy"):
+                return "wayland"
+            if which("xclip"):
+                return "x11"
+            if wayland and which("wl-paste"):
+                return "wayland"
+        return None
+
+    @staticmethod
+    def _is_png(data):
+        return bool(data) and data[:8] == b"\x89PNG\r\n\x1a\n"
+
+    # -- read ------------------------------------------------------------- #
+    def get_image(self):
+        try:
+            if self.backend == "windows":
+                data = self._win_get_image()
+            elif self.backend == "x11":
+                data = self._xclip_get_image()
+            elif self.backend == "wayland":
+                data = self._wl_get_image()
+            else:
+                return None
+        except Exception:
+            return None
+        return data if self._is_png(data) else None
+
+    # -- write ------------------------------------------------------------ #
+    def set_image(self, png):
+        if not self._is_png(png):
+            return False
+        try:
+            if self.backend == "windows":
+                return self._win_set_image(png)
+            if self.backend == "x11":
+                return self._xclip_set_image(png)
+            if self.backend == "wayland":
+                return self._wl_set_image(png)
+        except Exception:
+            return False
+        return False
+
+    # -- Linux Wayland ---------------------------------------------------- #
+    @staticmethod
+    def _wl_get_image():
+        try:
+            out = subprocess.run(["wl-paste", "--type", "image/png"],
+                                 capture_output=True, timeout=5)
+        except Exception:
+            return b""
+        return out.stdout if out.returncode == 0 else b""
+
+    def _wl_set_image(self, png):
+        try:
+            subprocess.run(["wl-copy", "--type", "image/png"],
+                           input=png, timeout=5, check=False)
+            return True
+        except Exception:
+            return False
+
+    # -- Linux X11 -------------------------------------------------------- #
+    @staticmethod
+    def _xclip_get_image():
+        try:
+            out = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+                capture_output=True, timeout=5)
+        except Exception:
+            return b""
+        return out.stdout if out.returncode == 0 else b""
+
+    def _xclip_set_image(self, png):
+        try:
+            subprocess.run(
+                ["xclip", "-selection", "clipboard", "-t", "image/png"],
+                input=png, timeout=5, check=False)
+            return True
+        except Exception:
+            return False
+
+    # -- Windows (CF_DIB via ctypes + Pillow) ----------------------------- #
+    @staticmethod
+    def _win_get_image():
+        import ctypes
+        from ctypes import wintypes
+        CF_DIB = 8
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.GetClipboardData.restype = wintypes.HANDLE
+        kernel32.GlobalSize.restype = wintypes.SIZE_T
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        if not user32.OpenClipboard(None):
+            return b""
+        try:
+            if not user32.IsClipboardFormatAvailable(CF_DIB):
+                return b""
+            h = user32.GetClipboardData(CF_DIB)
+            if not h:
+                return b""
+            size = kernel32.GlobalSize(h)
+            ptr = kernel32.GlobalLock(h)
+            if not ptr:
+                return b""
+            try:
+                buf = ctypes.string_at(ptr, size)
+            finally:
+                kernel32.GlobalUnlock(h)
+            return ImageClipboard._dib_to_png(buf) or b""
+        finally:
+            user32.CloseClipboard()
+
+    @staticmethod
+    def _win_set_image(png):
+        import ctypes
+        from ctypes import wintypes
+        CF_DIB = 8
+        GMEM_MOVEABLE = 0x0002
+        dib = ImageClipboard._png_to_dib(png)
+        if not dib:
+            return False
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, wintypes.SIZE_T]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(dib))
+        if not h:
+            return False
+        ptr = kernel32.GlobalLock(h)
+        if not ptr:
+            kernel32.GlobalFree(h)
+            return False
+        try:
+            ctypes.memmove(ptr, dib, len(dib))
+        finally:
+            kernel32.GlobalUnlock(h)
+        if not user32.OpenClipboard(None):
+            kernel32.GlobalFree(h)
+            return False
+        try:
+            user32.EmptyClipboard()
+            if not user32.SetClipboardData(CF_DIB, h):
+                kernel32.GlobalFree(h)
+                return False
+            return True
+        finally:
+            user32.CloseClipboard()
+
+    @staticmethod
+    def _dib_to_png(data):
+        try:
+            from PIL import Image
+            import struct as _s
+            import io as _io
+            if len(data) < 40:
+                return None
+            biSize, width, height, _, bitcount = _s.unpack_from(
+                "<IiiHH", data, 0)
+            comp = _s.unpack_from("<I", data, 16)[0]
+            color_used = _s.unpack_from("<I", data, 32)[0]
+            if color_used == 0 and bitcount < 16:
+                color_used = 1 << bitcount
+            pixoff = biSize + color_used * 4
+            if bitcount == 24:
+                mode = "RGB"
+            elif bitcount == 32:
+                mode = "RGBA" if comp == 3 else "RGB"
+            elif bitcount in (1, 4, 8):
+                mode = "P"
+            else:
+                return None
+            img = Image.frombytes(mode, (width, abs(height)), data[pixoff:],
+                                  "raw", mode, 0, -1 if height > 0 else 1)
+            if mode == "P":
+                pal = data[biSize:biSize + color_used * 4]
+                img.putpalette([b for i in range(0, len(pal), 4)
+                                for b in (pal[i + 2], pal[i + 1], pal[i])])
+            out = _io.BytesIO()
+            img.save(out, "PNG")
+            return out.getvalue()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _png_to_dib(png):
+        try:
+            from PIL import Image
+            import io as _io
+            img = Image.open(_io.BytesIO(png)).convert("RGBA")
+            buf = _io.BytesIO()
+            img.save(buf, "BMP")
+            bmp = buf.getvalue()
+            return bmp[14:]  # strip BITMAPFILEHEADER; CF_DIB wants the rest
+        except Exception:
+            return None
+
+
 # ------------------------------ peer network ------------------------------ #
 class PeerNet:
     def __init__(self, port, peers, clip, password=None, recv_dir=DEFAULT_RECV_DIR):
@@ -457,6 +699,9 @@ class PeerNet:
         self.file_clip = None            # optional FileClipboard (set by main)
         self._clipfile_lock = threading.Lock()
         self.last_recv_clip_sig = None   # sig of files we just placed on clipboard
+        self.image_clip = None           # optional ImageClipboard (set by main)
+        self._image_lock = threading.Lock()
+        self.last_recv_image_sig = None  # sig of image we just placed on clipboard
         # SHA-256 of the password; None means "open" (no auth required).
         self._pw_hash = (hashlib.sha256(password.encode("utf-8")).digest()
                          if password else None)
@@ -650,6 +895,8 @@ class PeerNet:
                     self._save_file(payload, peer_ip)
                 elif ftype == TYPE_CLIPFILES:
                     self._save_clip_files(payload, peer_ip)
+                elif ftype == TYPE_IMAGE:
+                    self._save_image(payload, peer_ip)
                 # Any other type is ignored.
         finally:
             with self._lock:
@@ -772,6 +1019,59 @@ class PeerNet:
     def recv_clip_sig(self):
         with self._clipfile_lock:
             return self.last_recv_clip_sig
+
+    # -- copy/paste of images (OS clipboard) ------------------------------ #
+    def mark_recv_image(self, png):
+        with self._image_lock:
+            self.last_recv_image_sig = hashlib.md5(png).digest()
+
+    def recv_image_sig(self):
+        with self._image_lock:
+            return self.last_recv_image_sig
+
+    def send_image(self, png):
+        """Send a copied image (PNG bytes) to all peers. Returns the number
+        of peers it reached (0 if none / too large)."""
+        if not png:
+            return 0
+        if len(png) > MAX_FILE_SIZE:
+            print("[!] Image too large; not sending.")
+            return 0
+        frame = build_frame(TYPE_IMAGE, png)
+        with self._lock:
+            peers = list(self.connections.items())
+        if not peers:
+            return 0
+        sent = 0
+        for _, sock in peers:
+            try:
+                sock.sendall(frame)
+                sent += 1
+            except Exception:
+                pass
+        print(f"[>] Sent image ({len(png)} bytes) to {sent} peer(s)")
+        return sent
+
+    def _save_image(self, payload, peer_ip):
+        if not payload:
+            return
+        print(f"[<] Received image ({len(payload)} bytes) from {peer_ip}")
+        if self.image_clip and self.image_clip.available:
+            if self.image_clip.set_image(payload):
+                self.mark_recv_image(payload)
+                # Keep the text baseline fresh so the text poller does not
+                # echo the (now empty/garbage) text target left behind.
+                try:
+                    v = self.clip.get()
+                    if v is not None:
+                        self.clip.last_value = v
+                except Exception:
+                    pass
+                print("[*] Image placed on clipboard - paste (Ctrl+V) to use it.")
+        else:
+            dest = self._write_recv_file("clipboard.png", payload, peer_ip)
+            if dest:
+                print(f"[*] No image clipboard backend; saved to {dest}")
 
     def send_clip_files(self, paths):
         """Send the given copied files to all peers as a single frame.
@@ -901,6 +1201,8 @@ def main():
                         help="Disable copy/paste file syncing (copying files "
                              "in the file manager is otherwise mirrored to "
                              "peers, ready to paste).")
+    parser.add_argument("--no-image", action="store_true",
+                        help="Disable picture (clipboard image) syncing.")
     parser.add_argument("--version", action="version",
                         version=f"clipshare {__version__}")
     args = parser.parse_args()
@@ -921,6 +1223,11 @@ def main():
         file_clip = FileClipboard()
         net.file_clip = file_clip
 
+    image_clip = None
+    if not args.no_image:
+        image_clip = ImageClipboard()
+        net.image_clip = image_clip
+
     net.start()
 
     if args.send_file:
@@ -936,15 +1243,41 @@ def main():
     else:
         print("[*] Copy/paste file sync: unavailable on this system "
               "(text still syncs)")
+    if image_clip and image_clip.available:
+        print(f"[*] Picture sync: on ({image_clip.describe()})")
+    elif args.no_image:
+        print("[*] Picture sync: off (--no-image)")
+    else:
+        print("[*] Picture sync: unavailable on this system "
+              "(received images are saved to recv_dir)")
     print("[*] Watching clipboard. Copy something to share it. Ctrl+C to quit.")
 
     last_clip_files_sig = None
     next_file_poll = 0.0
+    last_image_sig = None
+    next_image_poll = 0.0
     try:
         while _running.is_set():
             changed = clip.poll_changed()
             if changed is not None:
                 net.broadcast(changed)
+
+            if image_clip and image_clip.available and time.time() >= next_image_poll:
+                next_image_poll = time.time() + IMAGE_POLL_INTERVAL
+                img = image_clip.get_image()
+                if img:
+                    # While an image sits on the clipboard, keep the text
+                    # baseline fresh so the text poller does not echo the
+                    # (now empty/garbage) text target as a "change".
+                    v = clip.get()
+                    if v is not None:
+                        clip.last_value = v
+                    sig = hashlib.md5(img).digest()
+                    # Skip if unchanged, or if this is the image a peer just
+                    # pushed onto our clipboard (avoid echoing it back).
+                    if sig != last_image_sig and sig != net.recv_image_sig():
+                        last_image_sig = sig
+                        net.send_image(img)
 
             if file_clip and file_clip.available and time.time() >= next_file_poll:
                 next_file_poll = time.time() + FILE_POLL_INTERVAL
