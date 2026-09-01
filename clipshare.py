@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-clipshare - Share the clipboard between two PCs on the same LAN.
+clipshare - Share the clipboard between any number of computers on the same LAN.
 
-The *same* script runs unchanged on Windows and Linux. It auto-discovers the
-peer over a UDP broadcast; if your network blocks broadcasts you can pass
---peer <ip> to connect directly.
+The *same* script runs unchanged on Windows and Linux. It auto-discovers all
+peers over a UDP broadcast; if your network blocks broadcasts you can pass
+--peer <ip> (repeatable) to connect to specific peers directly.
 
 How it works
 ------------
-- Each node runs a TCP server (to receive clipboard updates) and, if it has
-  the "higher" IP, a TCP client (to push updates). This guarantees exactly one
-  connection between the two machines.
+- Every node runs a TCP server (to receive clipboard updates) and, for each
+  peer it learns about, a TCP client (to push updates). Together they form a
+  full mesh; duplicate connections are de-duplicated so there is exactly one
+  connection per peer pair, no matter how many nodes join.
 - A poller watches the local clipboard. When it changes *locally*, the new
-  text is sent to the peer. When an update arrives *from* the peer, it is
-  written to the local clipboard and marked as "remote" so it is not echoed
-  back (no sync loop).
+  text is sent to every connected peer. When an update arrives *from* a peer,
+  it is written to the local clipboard and marked as "remote" so it is not
+  echoed back (no sync loop).
+- Net effect: copy once on any node -> paste on any other node. With N nodes
+  the same clipboard is shared across all of them.
 
 Usage
 -----
@@ -1044,7 +1047,18 @@ class PeerNet:
         threading.Thread(target=self._reader, args=(conn, peer_ip),
                          daemon=True).start()
         print(f"[+] Connected to {peer_ip}:{self.port}")
+        self._log_mesh_status()
         return True
+
+    def _log_mesh_status(self):
+        """Print how many peers we are currently connected to (full mesh)."""
+        with self._lock:
+            peers = sorted(self.connections)
+        if peers:
+            print(f"[*] Mesh: connected to {len(peers)} peer(s): "
+                  f"{', '.join(peers)}")
+        else:
+            print("[*] Mesh: no peers connected")
 
     def _enable_keepalive(self, sock):
         try:
@@ -1159,6 +1173,7 @@ class PeerNet:
             except Exception:
                 pass
             print(f"[-] Disconnected from {peer_ip}")
+            self._log_mesh_status()
 
     # -- broadcast -------------------------------------------------------- #
     def broadcast(self, text):
