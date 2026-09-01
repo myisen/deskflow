@@ -6,10 +6,10 @@
 
 ```bash
 pip install -r requirements.txt
-# 仅 Linux 需要：安装剪贴板后端
-#   X11     : sudo apt install xclip
-#   Wayland : sudo dnf install wl-clipboard   （Fedora/RHEL）
-#             sudo apt install wl-clipboard   （Debian/Ubuntu）
+# Linux 剪贴板后端（可选）：
+#   X11     : 可选 —— 未安装 xclip 时自动使用内置 python-xlib 后端
+#   Wayland : 需要 sudo apt install wl-clipboard   （Debian/Ubuntu）
+#             sudo dnf install wl-clipboard       （Fedora/RHEL）
 ```
 
 ## 运行
@@ -85,12 +85,13 @@ python clipshare.py --no-file-clip
 平台支持：
 
 - **Windows**：原生支持（CF_HDROP）。
-- **Linux X11**：需要 `xclip`。
+- **Linux X11**：有 `xclip` 时优先使用；未安装时自动改用内置 python-xlib 后端。
 - **Linux Wayland**：需要 `wl-clipboard`（`wl-copy` / `wl-paste`）。
 - 若当前系统缺少上述后端，则该功能自动禁用（不影响文本同步）；启动时会打印当前状态。
 
 说明：
 
+- 复制的**文件或文件夹**都会被同步 —— 文件夹会被递归遍历，并在对端重建目录结构后放回其剪贴板，可在文件管理器中直接 Ctrl+V 粘贴。
 - 复制的文件同样受 2 GiB 总大小上限约束，并通过相同的认证通道传输。
 - 接收到的文件先保存到接收目录（见上文 `--recv-dir`），再放回剪贴板；同名文件会自动重命名以避免覆盖。
 - 已内置回环防护：对端推送并放到本地剪贴板的文件不会被再次回传。
@@ -133,7 +134,7 @@ python clipshare.py --no-image
 
 - 确保防火墙放行 TCP `32620`（以及用于发现的 UDP `54321`）。
 - 如果自动发现无法连接，优先使用 `--peer <ip>`。
-- Linux 需要 `xclip`（X11）或 `wl-clipboard`（Wayland）作为 `pyperclip` 的后端。
+- Linux 剪贴板后端：`xclip`（X11）或 `wl-clipboard`（Wayland）供 `pyperclip` 使用；X11 下未安装 `xclip` 时，程序会自动改用内置的 python-xlib 后端。
 
 ## 用户信息
 

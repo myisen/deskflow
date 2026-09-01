@@ -7,10 +7,11 @@ on both Windows and Linux**.
 
 ```bash
 pip install -r requirements.txt
-# Linux only: install a clipboard backend
-#   X11     : sudo apt install xclip
-#   Wayland : sudo dnf install wl-clipboard   (Fedora/RHEL)
-#             sudo apt install wl-clipboard   (Debian/Ubuntu)
+# Linux clipboard backend (optional):
+#   X11     : optional — when xclip is missing the built-in python-xlib
+#             backend is used automatically
+#   Wayland : sudo apt install wl-clipboard   (Debian/Ubuntu)
+#             sudo dnf install wl-clipboard   (Fedora/RHEL)
 ```
 
 ## Run
@@ -103,13 +104,17 @@ python clipshare.py --no-file-clip
 Platform support:
 
 - **Windows**: native (CF_HDROP).
-- **Linux X11**: requires `xclip`.
+- **Linux X11**: prefers `xclip`; when it is missing, the built-in python-xlib
+  backend is used automatically.
 - **Linux Wayland**: requires `wl-clipboard` (`wl-copy` / `wl-paste`).
 - If the backend is missing, the feature is disabled automatically (text sync
   still works); the current status is printed at startup.
 
 Notes:
 
+- Both copied **files and folders** are synced — folders are walked
+  recursively and rebuilt on the peer, then placed on its clipboard ready to
+  paste (Ctrl+V) in the file manager.
 - Copied files share the same 2 GiB total cap and travel over the same
   authenticated channel.
 - Received files are saved to the receive directory (see `--recv-dir` above)
@@ -169,7 +174,9 @@ Notes:
 
 - Make sure the firewall allows TCP `32620` (and UDP `54321` for discovery).
 - Prefer `--peer <ip>` if auto-discovery does not connect.
-- Linux requires `xclip` (X11) or `wl-clipboard` (Wayland) for `pyperclip`.
+- Linux clipboard backend: `xclip` (X11) or `wl-clipboard` (Wayland) for
+  `pyperclip`; on X11 without `xclip` the built-in python-xlib backend is used
+  automatically.
 
 ## User Information
 

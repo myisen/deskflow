@@ -1,1 +1,2 @@
 pyperclip>=1.8.0
+python-xlib>=0.24; sys_platform == "linux"
