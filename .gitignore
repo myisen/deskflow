@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 clipshare-*.tar.gz
 clipshare_recv/
+logs/

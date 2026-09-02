@@ -31,6 +31,9 @@ Usage
     python clipshare.py --no-file-clip                   # disable copy/paste of files
     # Copy a picture (e.g. a screenshot) -> it is mirrored to peers, ready to paste.
     python clipshare.py --no-image                       # disable picture syncing
+    # Logs are written by default to logs/ (one file per day, old logs pruned).
+    python clipshare.py --log-dir /var/log/clipshare     # custom log directory
+    python clipshare.py --log-dir ""                     # disable file logging
 
 The TCP server binds to 0.0.0.0 on port 32620 by default. When a password is
 set (via --password or CLIPSHARE_PASSWORD) every connection must authenticate
@@ -91,6 +94,109 @@ _running.set()
 def _handle_signal(signum, frame):
     """Stop cleanly on SIGTERM/SIGHUP (e.g. systemctl stop / service restart)."""
     _running.clear()
+
+
+# -------------------------------- logging --------------------------------- #
+LOG_DEFAULT_DIR = "logs"      # directory for per-day log files
+LOG_RETENTION_DAYS = 31        # delete log files older than this at startup
+
+
+class _DailyLogStream:
+    """Duplicates every write to a real stream and today's log file.
+
+    Wrapping sys.stdout/sys.stderr with this sends the existing print() output
+    to the console *and* a per-day file (logs/clipshare-YYYY-MM-DD.log) without
+    touching the many call sites. Each write re-checks the date, so a long
+    running process naturally rotates to the next day's file at midnight.
+    """
+
+    def __init__(self, stream, log_dir):
+        self._stream = stream
+        self._log_dir = log_dir
+        self._buf = ""
+
+    def _log_path(self):
+        return os.path.join(self._log_dir,
+                            "clipshare-%s.log" % time.strftime("%Y-%m-%d"))
+
+    def _append_log(self, text):
+        try:
+            with open(self._log_path(), "a", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError:
+            pass  # logging must never crash the daemon
+
+    def write(self, data):
+        try:
+            self._stream.write(data)
+        except Exception:
+            pass
+        if not data:
+            return len(data)
+        # Buffer and emit complete lines, prefixing each non-empty line with
+        # one timestamp. print() may call write() once per argument, so a
+        # whole line ("A B C") is assembled before it is logged.
+        self._buf += data
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line:
+                self._append_log("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                              line))
+            else:
+                self._append_log("\n")  # keep blank lines blank
+        return len(data)
+
+    def flush(self):
+        if self._buf:  # flush any trailing line that has no newline yet
+            self._append_log("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        self._buf))
+            self._buf = ""
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+
+def _cleanup_old_logs(log_dir, days=LOG_RETENTION_DAYS):
+    """Delete per-day log files older than ``days`` days (called at startup)."""
+    cutoff = time.time() - days * 86400
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith("clipshare-") or not name.endswith(".log"):
+            continue
+        path = os.path.join(log_dir, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def setup_logging(log_dir=LOG_DEFAULT_DIR):
+    """Create the log dir, prune old logs, tee stdout/stderr into today's log.
+
+    Call once, right after parsing the CLI arguments, before anything else is
+    printed. Pass an empty string to disable file logging entirely.
+    """
+    if not log_dir:
+        return
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError as e:
+        print(f"[!] Cannot create log dir {log_dir!r}: {e}")
+        return
+    _cleanup_old_logs(log_dir)
+    sys.stdout = _DailyLogStream(sys.stdout, log_dir)
+    sys.stderr = _DailyLogStream(sys.stderr, log_dir)
 
 
 def get_local_ip():
@@ -1515,9 +1621,15 @@ def main():
                              "peers, ready to paste).")
     parser.add_argument("--no-image", action="store_true",
                         help="Disable picture (clipboard image) syncing.")
+    parser.add_argument("--log-dir", default=LOG_DEFAULT_DIR, metavar="DIR",
+                        help=f"Directory for per-day log files "
+                             f"(default: {LOG_DEFAULT_DIR!r}); pass an empty "
+                             f"string to disable file logging.")
     parser.add_argument("--version", action="version",
                         version=f"clipshare {__version__}")
     args = parser.parse_args()
+
+    setup_logging(args.log_dir)
 
     if args.send_file and not os.path.isfile(args.send_file):
         raise SystemExit(f"[!] --send-file: not a file: {args.send_file!r}")

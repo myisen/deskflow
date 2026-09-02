@@ -13,6 +13,7 @@ command with NSSM (https://nssm.cc), see README.md.
 Usage (run in PowerShell):
   powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Install
   powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Status
+  powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Restart
   powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Uninstall
 
 Optional parameters:
@@ -26,6 +27,7 @@ Optional parameters:
 
 param(
     [switch]$Install,
+    [switch]$Restart,
     [switch]$Uninstall,
     [switch]$Status,
     [string]$RepoDir = (Split-Path -Parent $MyInvocation.MyCommand.Path),
@@ -103,10 +105,22 @@ function Show-ClipshareTask {
     }
 }
 
+function Restart-ClipshareTask {
+    if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+        Write-Host "[!] Task '$TaskName' is not installed. Run -Install first."
+        return
+    }
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Start-ScheduledTask -TaskName $TaskName
+    Write-Host "[*] Task '$TaskName' restarted."
+    Show-ClipshareTask
+}
+
 if ($Install)    { Install-ClipshareTask }
+elseif ($Restart) { Restart-ClipshareTask }
 elseif ($Uninstall) { Uninstall-ClipshareTask }
 elseif ($Status) { Show-ClipshareTask }
 else {
-    Write-Host "Usage: $($MyInvocation.MyCommand.Name) -Install | -Status | -Uninstall"
+    Write-Host "Usage: $($MyInvocation.MyCommand.Name) -Install | -Restart | -Status | -Uninstall"
     Write-Host "See the comment header for options."
 }

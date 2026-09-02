@@ -134,8 +134,9 @@ python clipshare.py --no-image
 # 安装并启动（用户级服务，无需 sudo）
 ./install_linux_service.sh install
 
-# 查看状态 / 实时日志 / 停止并卸载
+# 查看状态 / 重启 / 实时日志 / 停止并卸载
 ./install_linux_service.sh status
+./install_linux_service.sh restart
 journalctl --user -u clipshare -f
 ./install_linux_service.sh uninstall
 ```
@@ -157,8 +158,9 @@ sudo ./install_linux_service.sh install --system
 ```powershell
 # 在 PowerShell 中运行（首次安装）
 powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Install
-# 查看状态 / 卸载
+# 查看状态 / 重启 / 卸载
 powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Status
+powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Restart
 powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Uninstall
 ```
 
@@ -178,6 +180,25 @@ nssm start clipshare
 ```
 
 服务收到 SIGTERM 会优雅退出；日志可查看 systemd journal（Linux）或计划任务历史 / NSSM 日志（Windows）。
+
+## 日志
+
+程序默认会把输出同时写入控制台和 `logs/` 目录下的日志文件：
+
+- **按天分文件**：每天一个日志，如 `logs/clipshare-2026-09-02.log`；进程跨天运行会自动切到新一天的日志。
+- **自动清理**：每次启动时删除超过 **31 天**的旧日志文件。
+- **路径可改**：用 `--log-dir <目录>` 指定其它目录；传空字符串 `--log-dir ""` 可关闭文件日志（仍输出到控制台 / journal）。
+
+```bash
+# 默认输出到 ./logs/
+python clipshare.py
+
+# 自定义日志目录，或关闭文件日志
+python clipshare.py --log-dir /var/log/clipshare
+python clipshare.py --log-dir ""
+```
+
+> 作为 systemd 服务运行时，`journalctl --user -u clipshare -f` 与 `logs/` 文件会同时记录，互不冲突。
 
 ## 工作原理
 

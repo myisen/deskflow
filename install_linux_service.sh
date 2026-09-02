@@ -10,6 +10,7 @@
 # Usage:
 #   ./install_linux_service.sh install            # user service (recommended)
 #   ./install_linux_service.sh status             # show service status
+#   ./install_linux_service.sh restart            # restart the service
 #   ./install_linux_service.sh uninstall          # stop + remove the service
 #   sudo ./install_linux_service.sh install --system   # system-wide (before login)
 #
@@ -113,6 +114,12 @@ case "$ACTION" in
     status)
         "${CTRL[@]}" status clipshare --no-pager 2>&1 | head -30 || true
         ;;
+    restart)
+        "${CTRL[@]}" restart clipshare
+        sleep 1
+        echo "[*] clipshare service restarted (${MODE} mode)."
+        "${CTRL[@]}" status clipshare --no-pager 2>&1 | head -15 || true
+        ;;
     uninstall)
         "${CTRL[@]}" disable --now clipshare 2>/dev/null || true
         rm -f "$DEST"
@@ -120,7 +127,7 @@ case "$ACTION" in
         echo "[*] clipshare service removed (${MODE} mode)."
         ;;
     *)
-        echo "Usage: $0 {install|status|uninstall} [--system]" >&2
+        echo "Usage: $0 {install|status|restart|uninstall} [--system]" >&2
         exit 1
         ;;
 esac
