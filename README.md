@@ -124,6 +124,61 @@ python clipshare.py --no-image
 - 复制图片时会自动同步文本基线，避免把剪贴板残留的空文本误当作一次“文本变更”回传给对端。
 - 已内置回环防护：对端推送并放到本地剪贴板的图片不会被再次回传。
 
+## 作为服务运行（开机自启）
+
+### Linux（Fedora / UOS 等 systemd 发行版）
+
+推荐使用**用户级** systemd 服务：随图形会话启动，可直接读写 X11 / Wayland 剪贴板。
+
+```bash
+# 安装并启动（用户级服务，无需 sudo）
+./install_linux_service.sh install
+
+# 查看状态 / 实时日志 / 停止并卸载
+./install_linux_service.sh status
+journalctl --user -u clipshare -f
+./install_linux_service.sh uninstall
+```
+
+如需开机即运行、登录前就生效（无图形会话），可用系统级服务：
+
+```bash
+sudo ./install_linux_service.sh install --system
+```
+
+> 注意：系统级服务默认以 root 运行且没有图形会话环境；若要读写 X11 / Wayland 剪贴板，
+> 需在单元文件中补充 `User=`、`DISPLAY=`、`XAUTHORITY=`、`XDG_RUNTIME_DIR=` 等环境变量。
+
+### Windows
+
+方式一（推荐，无需额外安装）：注册一个**登录时自动启动**的计划任务，使用 `pythonw.exe`
+在后台静默运行（无控制台窗口），并在异常退出时自动重启：
+
+```powershell
+# 在 PowerShell 中运行（首次安装）
+powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Install
+# 查看状态 / 卸载
+powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Status
+powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Uninstall
+```
+
+可传参指定 Python / 接收目录 / 显式对端，例如：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Install `
+    -PythonExe C:\Python39\pythonw.exe -RecvDir D:\clip_recv -Peers "192.168.1.50,192.168.1.60"
+```
+
+方式二（真正的 Windows 服务，出现在“服务”管理器中）：用 [NSSM](https://nssm.cc) 包装：
+
+```bat
+nssm install clipshare "C:\Python39\pythonw.exe" "C:\path\to\clipshare.py" --recv-dir C:\path\to\clipshare_recv
+nssm set clipshare AppDirectory "C:\path\to\clipshare"
+nssm start clipshare
+```
+
+服务收到 SIGTERM 会优雅退出；日志可查看 systemd journal（Linux）或计划任务历史 / NSSM 日志（Windows）。
+
 ## 工作原理
 
 - 每个节点都运行一个 TCP 服务端（接收更新）以及每个对端一个 TCP 客户端（推送更新）。重复连接会被去重，因此每一对节点之间恰好只有一条连接 —— 在 N 个节点间形成全网状。

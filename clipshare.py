@@ -47,6 +47,7 @@ Dependencies
 import argparse
 import hashlib
 import os
+import signal
 import socket
 import struct
 import subprocess
@@ -85,6 +86,11 @@ IMAGE_POLL_INTERVAL = 0.5  # seconds between "copied image" clipboard polls
 # ------------------------------- globals ---------------------------------- #
 _running = threading.Event()
 _running.set()
+
+
+def _handle_signal(signum, frame):
+    """Stop cleanly on SIGTERM/SIGHUP (e.g. systemctl stop / service restart)."""
+    _running.clear()
 
 
 def get_local_ip():
@@ -1535,6 +1541,13 @@ def main():
         net.image_clip = image_clip
 
     net.start()
+
+    # Stop cleanly when run as a service (systemd sends SIGTERM on stop).
+    signal.signal(signal.SIGTERM, _handle_signal)
+    try:
+        signal.signal(signal.SIGHUP, _handle_signal)
+    except (AttributeError, ValueError, OSError):
+        pass  # SIGHUP is unavailable on Windows.
 
     if args.send_file:
         print(f"[*] Will send file once a peer connects: {args.send_file}")
