@@ -145,3 +145,52 @@
 
 - 对端 B 已改为 systemd 用户服务常驻（非手动 nohup），与 A 端一致。
 - Windows 实机部署与回归测试待有环境时补充。
+
+---
+
+## Part 3 截图（剪贴板图片）传输测试
+
+- 测试时间：2026-09-02
+- 测试对象：clipshare v0.3 + **x11py 图片后端**（为 X11 无 xclip 环境新增的 python-xlib 图片支持，如本机 UOS）
+- 测试方式：隔离测试网格（A2 ↔ B2，均跑新代码，端口 32621，独立于生产网格 32620），模拟“截图复制到剪贴板”后做双向传输，全部实机互测
+- 变更内容：`ImageClipboard` 新增 `x11py` 后端 —— `_detect_backend()` 在 X11 无 xclip 且 python-xlib 可用时回退到 x11py；`_x11py_get_image()` 用 `image/png` target 读取剪贴板 PNG，`_x11py_set_image()` 以 `image/png`/`PNG` target 占有剪贴板
+
+### 测试环境
+
+| 项 | A2（发送/接收方） | B2（接收/发送方） |
+|---|---|---|
+| 运行 | 沙箱内新代码实例（端口 32621） | 对端 B 新代码实例（端口 32621） |
+| 图片后端 | `Linux X11 (python-xlib)`（x11py） | `Linux Wayland (wl-clipboard)` |
+| 网格 | 1 对端（10.180.15.251） | 1 对端（10.180.15.216） |
+
+### 测试用例与结果
+
+| # | 功能 | 结果 | 说明 / 证据 |
+|---|---|---|---|
+| 1 | x11py 后端探测 | ✅ 通过 | 本机 UOS（X11、无 xclip）`ImageClipboard().backend == "x11py"`，describe 显示 `Linux X11 (python-xlib)` |
+| 2 | x11py 本地往返 | ✅ 通过 | `set_image(png)` 后 `get_image()` md5 一致（76 字节 PNG）；`x11_paste(("image/png",))` 可取回；非 PNG 数据被拒绝；图片占有剪贴板时文本读取返回 None（不误触发文本轮询） |
+| 3 | A→B2 截图传输 | ✅ 通过 | A2 的 X11 剪贴板放入 PNG → A2 检测发送 → B2 收到并 `wl-copy` 到 Wayland 剪贴板 → `wl-paste --type image/png` md5 一致（`8c6411386f832bc4d9a6e90c38bfd53b`） |
+| 4 | B2→A 截图传输 | ✅ 通过 | B 的 Wayland 剪贴板放入 PNG → B2 检测发送 → A2 收到并以 x11py 放入 X11 剪贴板 → `get_image()` md5 一致 |
+| 5 | 文本同步回归 | ✅ 通过 | 同一隔离网格内 A→B2 文本 `CS-IMG-REGRESSION-*` 正常同步（图片改动不影响文本） |
+| 6 | 回环防护 | ✅ 通过 | 双向传输均未出现重复回传/无限循环（测试正常结束、无重复图片） |
+
+### 关键日志摘录（A2）
+
+```
+[*] Picture sync: on (Linux X11 (python-xlib))
+[+] Connected to 10.180.15.251:32621
+[*] Mesh: connected to 1 peer(s): 10.180.15.251
+```
+
+### 结论
+
+1. **无 xclip 的 X11 也可传输截图**：python-xlib 图片后端使本机 UOS 一类环境具备剪贴板图片的检测与放回能力，截图复制后即可跨机粘贴。
+2. **双向链路完整**：X11(x11py) ↔ Wayland(wl) 之间 PNG 传输、解码、剪贴板放回均正确。
+3. **无副作用**：图片占位不影响文本轮询，回环防护正常，文本同步无回归。
+4. **已知限制**：
+   - 本机宿主 A 的服务仍运行旧代码（沙箱无法重启宿主进程），x11py 图片后端需宿主下次重启服务后生效；其在沙箱内的实机验证已通过（同一 X 显示）。
+   - 截图传输依赖截图工具把 PNG 放进系统剪贴板（与现有文本/图片同步一致的触发方式）。
+
+### 遗留事项
+
+- 待宿主 A 重启 clipshare 服务后，可做一次生产网格内的截图实机回归。

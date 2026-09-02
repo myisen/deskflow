@@ -827,7 +827,8 @@ class ImageClipboard:
     Cross-platform, best effort:
       - Windows : native CF_DIB via ctypes (requires Pillow to convert).
       - Linux   : xclip (X11) / wl-clipboard (Wayland) using the
-                  'image/png' target.
+                  'image/png' target; when xclip is missing the built-in
+                  python-xlib backend ('x11py') is used on X11 instead.
     On unsupported systems (or when Pillow is missing on Windows) every method
     degrades to a harmless no-op and the image is saved as a PNG in recv_dir
     instead.
@@ -844,6 +845,7 @@ class ImageClipboard:
         return {
             "windows": "Windows native (CF_DIB)",
             "x11": "Linux X11 (xclip)",
+            "x11py": "Linux X11 (python-xlib)",
             "wayland": "Linux Wayland (wl-clipboard)",
         }.get(self.backend, "unavailable on this system")
 
@@ -859,6 +861,8 @@ class ImageClipboard:
                 return "x11"
             if wayland and which("wl-paste"):
                 return "wayland"
+            if _x11_available():
+                return "x11py"  # no xclip: fall back to the python-xlib backend
         return None
 
     @staticmethod
@@ -872,6 +876,8 @@ class ImageClipboard:
                 data = self._win_get_image()
             elif self.backend == "x11":
                 data = self._xclip_get_image()
+            elif self.backend == "x11py":
+                data = self._x11py_get_image()
             elif self.backend == "wayland":
                 data = self._wl_get_image()
             else:
@@ -889,6 +895,8 @@ class ImageClipboard:
                 return self._win_set_image(png)
             if self.backend == "x11":
                 return self._xclip_set_image(png)
+            if self.backend == "x11py":
+                return self._x11py_set_image(png)
             if self.backend == "wayland":
                 return self._wl_set_image(png)
         except Exception:
@@ -932,6 +940,20 @@ class ImageClipboard:
             return True
         except Exception:
             return False
+
+    # -- Linux X11 (python-xlib, no xclip needed) ------------------------- #
+    @staticmethod
+    def _x11py_get_image():
+        """Read clipboard image as PNG via python-xlib (target 'image/png')."""
+        data = x11_paste(("image/png", "PNG"))
+        if data and data[:8] == b"\x89PNG\r\n\x1a\n":
+            return data
+        return b""
+
+    def _x11py_set_image(self, png):
+        """Own the CLIPBOARD as an image/png owner using python-xlib."""
+        owner = _X11SelectionOwner({"image/png": png, "PNG": png})
+        return bool(owner)
 
     # -- Windows (CF_DIB via ctypes + Pillow) ----------------------------- #
     @staticmethod
