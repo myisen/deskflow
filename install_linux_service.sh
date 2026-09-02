@@ -25,10 +25,30 @@ if [[ "${2:-}" == "--system" ]]; then MODE="system"; fi
 
 # Session environment that a graphical clipboard backend needs (used for
 # system-wide mode; a user service inherits this from your session already).
+#
+# When this script runs inside a desktop shell these variables are already in
+# the environment. When it runs over SSH / from a terminal outside the session,
+# copy them from a running desktop process so the unit still gets clipboard
+# access (this is what makes `install` work over SSH on Fedora/UOS).
+detect_session_env() {
+    local pid line
+    for pid in $(pgrep -u "$(id -u)" -f 'plasma|kwin|gnome-shell|xfce4-session|mate-session|dde-session|Xorg|Xwayland' 2>/dev/null); do
+        line=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null || true)
+        [[ -n "${WAYLAND_DISPLAY:-}" ]] || WAYLAND_DISPLAY=$(echo "$line" | sed -n 's/^WAYLAND_DISPLAY=//p' | head -1)
+        [[ -n "${DISPLAY:-}" ]] || DISPLAY=$(echo "$line" | sed -n 's/^DISPLAY=//p' | head -1)
+        [[ -n "${XDG_RUNTIME_DIR:-}" ]] || XDG_RUNTIME_DIR=$(echo "$line" | sed -n 's/^XDG_RUNTIME_DIR=//p' | head -1)
+        [[ -n "${XAUTHORITY:-}" ]] || XAUTHORITY=$(echo "$line" | sed -n 's/^XAUTHORITY=//p' | head -1)
+        [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || DBUS_SESSION_BUS_ADDRESS=$(echo "$line" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -1)
+        [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]] && break
+    done
+}
+detect_session_env
+
 SESSION_ENV=()
 if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
     SESSION_ENV+=("Environment=WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
     SESSION_ENV+=("Environment=XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}")
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && SESSION_ENV+=("Environment=DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
 elif [[ -n "${DISPLAY:-}" ]]; then
     SESSION_ENV+=("Environment=DISPLAY=$DISPLAY")
     SESSION_ENV+=("Environment=XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}")
