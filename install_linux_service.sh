@@ -60,6 +60,8 @@ Type=simple
 ExecStart=$PYTHON $CLIPSHARE_DIR/clipshare.py
 WorkingDirectory=$CLIPSHARE_DIR
 $(printf '%s\n' "${SESSION_ENV[@]}")
+# Stream stdout line-by-line so journalctl shows logs in real time.
+Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=5
 
