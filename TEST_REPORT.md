@@ -1,4 +1,12 @@
-# clipshare 跨机测试报告（Linux ↔ Linux）
+# clipshare 测试报告
+
+> 本报告包含两部分：
+> - **Part 1**：Linux ↔ Linux 剪贴板同步功能测试（2026-09-01）
+> - **Part 2**：服务化启动（systemd / Windows 计划任务）功能测试（2026-09-02）
+
+---
+
+## Part 1 跨机功能测试（Linux ↔ Linux）
 
 - 测试时间：2026-09-01 15:0x ~ 15:2x
 - 测试对象：clipshare v0.3（commit df5f8c1，含内置 python-xlib X11 后端 + 文件夹同步）
@@ -73,3 +81,67 @@
 
 - 测试产生的接收文件保留在双方 `clipshare_recv/`（已被 .gitignore 忽略），可手动清理。
 - 对端 B 的 clipshare 仍在常驻运行；本机 A 的测试实例已停止。
+
+---
+
+## Part 2 服务化启动功能测试
+
+- 测试时间：2026-09-02
+- 测试对象：clipshare v0.3 + 服务化改动（commit 36c6b99 起）
+  - `clipshare.py`：SIGTERM/SIGHUP 信号处理，主循环收到信号后打印 `[*] Stopped.` 并干净退出
+  - `install_linux_service.sh`：Fedora/UOS systemd 服务安装脚本（用户级 / `--system` 系统级），支持从桌面进程自动探测图形会话环境（Wayland/X11），并设置 `PYTHONUNBUFFERED=1` 使 journalctl 实时显示日志
+  - `install_windows_service.ps1`：Windows 计划任务安装脚本（`pythonw.exe` 静默运行、异常自动重启），另附 NSSM 真服务方案（README）
+- 测试方式：本机 A（UOS）与对端 B（Fedora）实机安装 systemd 用户服务并互测；Windows 仅提供脚本（无 Windows 实机，未实机执行）
+
+### 测试环境
+
+| 项 | 本机 A | 对端 B |
+|---|---|---|
+| IP | 10.180.15.216 | 10.180.15.251 |
+| 系统 | UOS（X11） | Fedora 44 KDE（Wayland） |
+| 服务化方式 | systemd 用户服务 | systemd 用户服务 |
+| 会话环境 | DISPLAY=:0 + python-xlib | WAYLAND_DISPLAY=wayland-0 + wl-clipboard |
+| 剪贴板后端 | 内置 python-xlib（x11py） | wl-clipboard（Wayland） |
+
+### 测试用例与结果
+
+| # | 功能 | 结果 | 说明 / 证据 |
+|---|---|---|---|
+| 1 | systemd 用户服务安装 | ✅ 通过 | 本机与对端 B 均执行 `./install_linux_service.sh install` 成功，单元写入 `~/.config/systemd/user/clipshare.service` 并启用 |
+| 2 | SSH 环境自动探测 | ✅ 通过 | 对端 B 通过 SSH（无会话环境变量）安装，脚本从 plasmashell 探测到 `WAYLAND_DISPLAY=wayland-0`、`XDG_RUNTIME_DIR=/run/user/1000`、`DBUS_SESSION_BUS_ADDRESS` 写入单元 |
+| 3 | 服务自启状态 | ✅ 通过 | 两端 `systemctl --user is-active` = active、`is-enabled` = enabled |
+| 4 | 服务内后端可用 | ✅ 通过 | 对端 B journal：`Copy/paste file sync: on (Linux Wayland (wl-clipboard))`、`Picture sync: on` |
+| 5 | 服务内组网 | ✅ 通过 | 对端 B journal：`Mesh: connected to 2 peer(s): 10.180.15.216, 10.180.15.233` |
+| 6 | 服务内日志实时性 | ✅ 通过 | 单元含 `PYTHONUNBUFFERED=1`，journal 逐行实时显示（含 Mesh/连接日志） |
+| 7 | SIGTERM 优雅退出 | ✅ 通过 | 对端 B 实例收到 SIGTERM 后日志输出 `[*] Stopped.`，进程清零（`exited cleanly, zero daemons`） |
+| 8 | 服务实例端到端同步 | ✅ 通过 | 本机 A 写入 `SVC-FINAL-1788329248`，经 systemd 服务实例同步，对端 B `wl-paste` 读到相同文本 |
+| 9 | 反向同步 | ✅ 通过 | 对端 B `wl-copy` 写入 `REVERSE-1788328201`，本机 A 读到相同文本 |
+| 10 | Windows 服务化脚本 | ⚠️ 未实机 | `install_windows_service.ps1`（计划任务）与 NSSM 方案已提供并在 README 说明；当前无 Windows 主机，未实机执行 |
+
+### 关键日志摘录（对端 B systemd journal）
+
+```
+[*] Local IP: 10.180.15.251  TCP port: 32620
+[*] Copy/paste file sync: on (Linux Wayland (wl-clipboard))
+[*] Picture sync: on (Linux Wayland (wl-clipboard))
+[*] Watching clipboard. Copy something to share it. Ctrl+C to quit.
+[+] Connected to 10.180.15.233:32620
+[*] Mesh: connected to 1 peer(s): 10.180.15.233
+[+] Connected to 10.180.15.216:32620
+[*] Mesh: connected to 2 peer(s): 10.180.15.216, 10.180.15.233
+```
+
+### 结论
+
+1. **Linux 服务化（Fedora/UOS）**：systemd 用户服务可安装、随图形会话自启、常驻运行，剪贴板后端与组网在服务环境下完全正常。
+2. **SSH 安装**：新增的图形会话环境自动探测使脚本可在无会话终端下正确生成含 `WAYLAND_DISPLAY`/`DISPLAY` 等变量的服务单元。
+3. **优雅退出**：SIGTERM/SIGHUP 处理生效，`systemctl --user stop clipshare` 可干净停止并释放资源。
+4. **日志**：`PYTHONUNBUFFERED=1` 保证 `journalctl --user -u clipshare -f` 实时可见日志。
+5. **已知限制**：
+   - Windows 侧脚本（计划任务 / NSSM）未在真实 Windows 主机上执行，仅提供与文档化；首次部署建议先 `-Status` 确认任务创建成功。
+   - 系统级服务（`install --system`）以 root 运行且无图形会话，需按 README 说明补充 `User=`/`DISPLAY=`/`XAUTHORITY=` 等变量后方可读写剪贴板。
+
+### 遗留事项
+
+- 对端 B 已改为 systemd 用户服务常驻（非手动 nohup），与 A 端一致。
+- Windows 实机部署与回归测试待有环境时补充。
