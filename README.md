@@ -159,8 +159,9 @@ sudo ./install_linux_service.sh install --system --user liang --log-dir /var/log
 >   使服务以该用户身份运行、可读写其 X11 / Wayland 剪贴板；
 > - **会话环境**：从目标用户的桌面进程自动读取 `WAYLAND_DISPLAY` / `DISPLAY` / `XAUTHORITY` /
 >   `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` 写入单元（SSH 安装同样生效）；
-> - **日志与接收目录**：自动追加 `--log-dir`（默认 `<仓库>/logs`）与 `--recv-dir`
->   （默认 `<仓库>/clipshare_recv`），并把目录属主改为服务用户，避免以 root 家目录落日志。
+> - **日志与接收目录**：自动追加 `--log-dir`（默认 `/var/log/clipshare`，不可写时回退到
+>   `<仓库>/logs`）与 `--recv-dir`（默认 `<仓库>/clipshare_recv`），并把目录属主改为服务用户，
+>   避免以 root 家目录落日志。
 >
 > 若代码目录所在路径服务用户不可读，安装时会给出提示，请把仓库放到共享路径（如 `/opt/clipshare`）。
 > 日志：`journalctl -u clipshare -f`。
@@ -198,14 +199,17 @@ nssm start clipshare
 
 ## 日志
 
-程序默认会把输出同时写入控制台和 `logs/` 目录下的日志文件：
+程序默认会把输出同时写入控制台和 `/var/log/clipshare/clipshare.log`（服务方式安装时自动创建
+并设置属主；普通手动运行若该目录不可写，会自动回退到仓库内 `logs/`）：
 
-- **按天分文件**：每天一个日志，如 `logs/clipshare-2026-09-02.log`；进程跨天运行会自动切到新一天的日志。
-- **自动清理**：每次启动时删除超过 **31 天**的旧日志文件。
+- **单一日志文件**：固定写 `clipshare.log`，进程跨天运行无需切换文件。
+- **系统级清理（推荐）**：安装服务时自动写入 `/etc/logrotate.d/clipshare`，由 logrotate **按天
+  轮转、压缩旧日志、保留 30 天**，并自动删除过期日志 —— 与系统其他 `/var/log` 服务一致。
+- **兜底清理**：即使系统没有配置 logrotate，程序每次启动也会删除超过 **31 天**的旧日志文件。
 - **路径可改**：用 `--log-dir <目录>` 指定其它目录；传空字符串 `--log-dir ""` 可关闭文件日志（仍输出到控制台 / journal）。
 
 ```bash
-# 默认输出到 ./logs/
+# 默认输出到 /var/log/clipshare/（不可写时回退 ./logs/）
 python clipshare.py
 
 # 自定义日志目录，或关闭文件日志
@@ -213,7 +217,8 @@ python clipshare.py --log-dir /var/log/clipshare
 python clipshare.py --log-dir ""
 ```
 
-> 作为 systemd 服务运行时，`journalctl --user -u clipshare -f` 与 `logs/` 文件会同时记录，互不冲突。
+> 作为 systemd 服务运行时，`journalctl --user -u clipshare -f` 与 `/var/log/clipshare/clipshare.log`
+> 文件会同时记录，互不冲突。
 
 ## 工作原理
 

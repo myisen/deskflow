@@ -31,7 +31,9 @@ Usage
     python clipshare.py --no-file-clip                   # disable copy/paste of files
     # Copy a picture (e.g. a screenshot) -> it is mirrored to peers, ready to paste.
     python clipshare.py --no-image                       # disable picture syncing
-    # Logs are written by default to logs/ (one file per day, old logs pruned).
+    # Logs go to /var/log/clipshare by default (fall back to logs/ if not
+    # writable, e.g. a non-root manual run). Rotation/retention is handled by
+    # logrotate (keep 1 month); --log-dir overrides; "" disables file logging.
     python clipshare.py --log-dir /var/log/clipshare     # custom log directory
     python clipshare.py --log-dir ""                     # disable file logging
 
@@ -97,17 +99,19 @@ def _handle_signal(signum, frame):
 
 
 # -------------------------------- logging --------------------------------- #
-LOG_DEFAULT_DIR = "logs"      # directory for per-day log files
-LOG_RETENTION_DAYS = 31        # delete log files older than this at startup
+LOG_DEFAULT_DIR = "/var/log/clipshare"  # default system log directory
+LOG_FILE_NAME = "clipshare.log"          # active log file (logrotate rotates it)
+LOG_RETENTION_DAYS = 31       # delete rotated/old log files older than this
 
 
-class _DailyLogStream:
-    """Duplicates every write to a real stream and today's log file.
+class _LogStream:
+    """Duplicate every write to a real stream and the log file.
 
     Wrapping sys.stdout/sys.stderr with this sends the existing print() output
-    to the console *and* a per-day file (logs/clipshare-YYYY-MM-DD.log) without
-    touching the many call sites. Each write re-checks the date, so a long
-    running process naturally rotates to the next day's file at midnight.
+    to the console *and* the log file (<log_dir>/clipshare.log) without touching
+    the many call sites. The file is opened per write (append), so logrotate may
+    rotate/rename it at any time; the next write simply re-opens the current
+    clipshare.log.
     """
 
     def __init__(self, stream, log_dir):
@@ -116,8 +120,7 @@ class _DailyLogStream:
         self._buf = ""
 
     def _log_path(self):
-        return os.path.join(self._log_dir,
-                            "clipshare-%s.log" % time.strftime("%Y-%m-%d"))
+        return os.path.join(self._log_dir, LOG_FILE_NAME)
 
     def _append_log(self, text):
         try:
@@ -164,14 +167,20 @@ class _DailyLogStream:
 
 
 def _cleanup_old_logs(log_dir, days=LOG_RETENTION_DAYS):
-    """Delete per-day log files older than ``days`` days (called at startup)."""
+    """Remove rotated log files older than ``days`` days (called at startup).
+
+    Safety net for systems without logrotate: logrotate normally keeps the
+    latest 30 daily rotations (clipshare.log-YYYYMMDD.gz) and deletes older
+    ones, but if it is not configured this removes anything older than the
+    retention window. The active clipshare.log itself is never touched.
+    """
     cutoff = time.time() - days * 86400
     try:
         names = os.listdir(log_dir)
     except OSError:
         return
     for name in names:
-        if not name.startswith("clipshare-") or not name.endswith(".log"):
+        if not name.startswith(LOG_FILE_NAME) or name == LOG_FILE_NAME:
             continue
         path = os.path.join(log_dir, name)
         try:
@@ -181,22 +190,37 @@ def _cleanup_old_logs(log_dir, days=LOG_RETENTION_DAYS):
             pass
 
 
-def setup_logging(log_dir=LOG_DEFAULT_DIR):
-    """Create the log dir, prune old logs, tee stdout/stderr into today's log.
+def setup_logging(log_dir=None):
+    """Create the log dir, prune old logs, tee stdout/stderr into the log file.
 
     Call once, right after parsing the CLI arguments, before anything else is
-    printed. Pass an empty string to disable file logging entirely.
+    printed. ``log_dir`` defaults to LOG_DEFAULT_DIR (/var/log/clipshare); pass
+    an empty string to disable file logging entirely. When the default system
+    directory is not writable (e.g. a non-root manual run) it falls back to a
+    repo-local ``logs/`` directory so file logging still works.
     """
+    if log_dir is None:
+        log_dir = LOG_DEFAULT_DIR
     if not log_dir:
         return
     try:
         os.makedirs(log_dir, exist_ok=True)
     except OSError as e:
-        print(f"[!] Cannot create log dir {log_dir!r}: {e}")
-        return
+        if log_dir == LOG_DEFAULT_DIR:
+            fallback = "logs"
+            try:
+                os.makedirs(fallback, exist_ok=True)
+            except OSError:
+                print(f"[!] Cannot create log dir {log_dir!r} nor {fallback!r}: {e}")
+                return
+            print(f"[!] {log_dir!r} not writable; using {fallback!r} instead.")
+            log_dir = fallback
+        else:
+            print(f"[!] Cannot create log dir {log_dir!r}: {e}")
+            return
     _cleanup_old_logs(log_dir)
-    sys.stdout = _DailyLogStream(sys.stdout, log_dir)
-    sys.stderr = _DailyLogStream(sys.stderr, log_dir)
+    sys.stdout = _LogStream(sys.stdout, log_dir)
+    sys.stderr = _LogStream(sys.stderr, log_dir)
 
 
 def get_local_ip():
@@ -1643,10 +1667,11 @@ def main():
                              "peers, ready to paste).")
     parser.add_argument("--no-image", action="store_true",
                         help="Disable picture (clipboard image) syncing.")
-    parser.add_argument("--log-dir", default=LOG_DEFAULT_DIR, metavar="DIR",
-                        help=f"Directory for per-day log files "
-                             f"(default: {LOG_DEFAULT_DIR!r}); pass an empty "
-                             f"string to disable file logging.")
+    parser.add_argument("--log-dir", default=None, metavar="DIR",
+                        help=f"Directory for the log file "
+                             f"(default: {LOG_DEFAULT_DIR!r}, falling back to "
+                             f"logs/ when not writable); pass an empty string "
+                             f"to disable file logging.")
     parser.add_argument("--version", action="version",
                         version=f"clipshare {__version__}")
     args = parser.parse_args()

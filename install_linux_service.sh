@@ -19,7 +19,8 @@
 #   --user <name>    run the service as this OS user (default: auto-detect the
 #                    user owning the graphical desktop session; fallback: the
 #                    user who invoked sudo)
-#   --log-dir <dir>  where per-day logs are written (default: <repo>/logs)
+#   --log-dir <dir>  where logs are written (default: /var/log/clipshare;
+#                    falls back to <repo>/logs when not writable)
 #   --recv-dir <dir> where received files are stored (default: <repo>/clipshare_recv)
 #
 # In system mode the graphical session environment (WAYLAND_DISPLAY / DISPLAY /
@@ -77,6 +78,7 @@ else
     SERVICE_USER="$(id -un)"
 fi
 SERVICE_UID="$(id -u "$SERVICE_USER" 2>/dev/null || echo 1000)"
+SERVICE_GROUP="$(id -gn "$SERVICE_USER" 2>/dev/null || echo nogroup)"
 
 # ---- detect graphical session env from the target user's desktop processes -- #
 detect_session_env() {
@@ -106,8 +108,15 @@ elif [[ -n "${DISPLAY:-}" ]]; then
 fi
 
 # ---- directories: logs & received files -------------------------------------- #
-LOG_DIR="${LOG_DIR:-$CLIPSHARE_DIR/logs}"
+LOG_DIR="${LOG_DIR:-/var/log/clipshare}"
 RECV_DIR="${RECV_DIR:-$CLIPSHARE_DIR/clipshare_recv}"
+# In user mode the default /var/log/clipshare usually needs root to create;
+# fall back to a repo-local dir so a plain (non-root) install still works.
+if [[ "$MODE" == "user" && "$ACTION" == "install" && ! -d "$LOG_DIR" ]] \
+   && ! mkdir -p "$LOG_DIR" 2>/dev/null; then
+    LOG_DIR="$CLIPSHARE_DIR/logs"
+    echo "[!] /var/log/clipshare not writable; logs will go to $LOG_DIR" >&2
+fi
 
 # ---- mode-specific unit settings --------------------------------------------- #
 if [[ "$MODE" == "user" ]]; then
@@ -158,6 +167,27 @@ EOF
     fi
 }
 
+LOGROTATE_DEST="/etc/logrotate.d/clipshare"
+
+write_logrotate() {
+    local content
+    content=$(sed -e "s/__LOG_USER__/$SERVICE_USER/g" \
+                  -e "s/__LOG_GROUP__/$SERVICE_GROUP/g" \
+                  "$CLIPSHARE_DIR/logrotate-clipshare.conf")
+    if [[ $EUID -eq 0 ]]; then
+        printf '%s\n' "$content" > "$LOGROTATE_DEST"
+        echo "[*] Wrote $LOGROTATE_DEST (logrotate: daily, keep 30 days)"
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        printf '%s\n' "$content" | sudo tee "$LOGROTATE_DEST" >/dev/null
+        echo "[*] Wrote $LOGROTATE_DEST via sudo (logrotate: daily, keep 30 days)"
+    else
+        echo "[!] logrotate config not installed (need root for $LOGROTATE_DEST)." >&2
+        echo "    Manual: sudo sed -e 's/__LOG_USER__/$SERVICE_USER/g' -e \\" >&2
+        echo "        's/__LOG_GROUP__/$SERVICE_GROUP/g' \\" >&2
+        echo "        $CLIPSHARE_DIR/logrotate-clipshare.conf > $LOGROTATE_DEST" >&2
+    fi
+}
+
 case "$ACTION" in
     install)
         if ! command -v systemctl >/dev/null 2>&1; then
@@ -182,6 +212,7 @@ case "$ACTION" in
             fi
         fi
         write_unit
+        write_logrotate
         "${CTRL[@]}" daemon-reload
         "${CTRL[@]}" enable --now clipshare
         if [[ "$MODE" == "user" ]]; then

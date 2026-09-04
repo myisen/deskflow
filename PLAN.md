@@ -17,7 +17,7 @@ clipshare：局域网多主机剪贴板共享（Windows / Linux 同一份 Python
 | 密码认证 | `--password` / `CLIPSHARE_PASSWORD`，口令 SHA-256 比对，未通过认证的连接被拒绝 |
 | 文件/文件夹同步 | 复制文件或文件夹自动镜像到对端；递归遍历、相对路径保留、防路径穿越、回环防护、2 GiB 上限 |
 | 图片/截图同步 | 剪贴板图片（截图）以 PNG 传输并放回对端剪贴板；Windows CF_DIB、X11 xclip、Wayland wl-clipboard、X11 无 xclip 时用内置 python-xlib（x11py）后端 |
-| 日志 | 默认输出到 `logs/`，按天分文件（`clipshare-YYYY-MM-DD.log`），启动清理超 31 天旧日志；`--log-dir` 可改/可关 |
+| 日志 | 默认输出到 `/var/log/clipshare/clipshare.log`（不可写时回退 `logs/`），单一日志文件；安装服务时自动配置 logrotate（按天轮转、压缩、保留 30 天），启动时兜底清理超 31 天旧日志；`--log-dir` 可改/可关 |
 | Linux 服务化 | systemd 用户级/系统级服务：`install_linux_service.sh {install|status|restart|uninstall} [--system]`，支持图形会话环境自动探测、SIGTERM/SIGHUP 优雅退出 |
 | Windows 服务化 | 计划任务（pythonw 静默后台、异常自重启）+ NSSM 真服务方案：`install_windows_service.ps1 -Install/-Restart/-Status/-Uninstall` |
 | 测试与文档 | `TEST_REPORT.md` 记录各阶段实机测试；README 中英双语 |
@@ -32,6 +32,7 @@ clipshare：局域网多主机剪贴板共享（Windows / Linux 同一份 Python
 - [ ] **P0-Windows 实机验证**：在有 Windows 主机后，实测计划任务/NSSM 服务脚本、CF_HDROP 文件剪贴板、CF_DIB 图片剪贴板、日志功能；结果记入 TEST_REPORT
 - [X] **P1-系统级服务增强**：`install_linux_service.sh install --system` 自动配置 `User=`、会话环境变量、`--log-dir`/`--recv-dir`，新增 `preview` 动作，免去手工配置
 - [X] **P1-日志落点明确**：系统级服务单元默认追加 `--log-dir`（避免 root 家目录产生日志），自动创建并 chown 目录；README 已更新
+- [X] **P1-日志模块完善**：默认日志目录改为 `/var/log/clipshare`，固定单一日志文件 `clipshare.log`（logrotate 友好）；安装服务时自动写入 `/etc/logrotate.d/clipshare`（按天轮转、压缩、保留 30 天并自动清理过期日志，跟随系统日志清理机制）；非 root/手动运行不可写时自动回退 `logs/`，启动时兜底清理超 31 天旧日志
 
 ### 2.2 中期（平台完善）
 
