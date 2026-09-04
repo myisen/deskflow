@@ -144,11 +144,26 @@ journalctl --user -u clipshare -f
 如需开机即运行、登录前就生效（无图形会话），可用系统级服务：
 
 ```bash
+# 安装并启动（系统级服务，需要 root；即使通过 SSH 安装也会自动探测图形会话环境）
 sudo ./install_linux_service.sh install --system
+
+# 可指定运行用户 / 日志目录 / 接收目录；也可用 --user=NAME 形式传参
+sudo ./install_linux_service.sh install --system --user liang --log-dir /var/log/clipshare --recv-dir /data/clip_recv
+
+# 先预览将要生成的 unit（不实际安装），便于核对
+./install_linux_service.sh preview --system
 ```
 
-> 注意：系统级服务默认以 root 运行且没有图形会话环境；若要读写 X11 / Wayland 剪贴板，
-> 需在单元文件中补充 `User=`、`DISPLAY=`、`XAUTHORITY=`、`XDG_RUNTIME_DIR=` 等环境变量。
+> 系统级服务自动完成三件事，无需再手工改单元文件：
+> - **运行用户**：默认自动探测图形会话的桌面用户（也可用 `--user` 指定），并写入 `User=`，
+>   使服务以该用户身份运行、可读写其 X11 / Wayland 剪贴板；
+> - **会话环境**：从目标用户的桌面进程自动读取 `WAYLAND_DISPLAY` / `DISPLAY` / `XAUTHORITY` /
+>   `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` 写入单元（SSH 安装同样生效）；
+> - **日志与接收目录**：自动追加 `--log-dir`（默认 `<仓库>/logs`）与 `--recv-dir`
+>   （默认 `<仓库>/clipshare_recv`），并把目录属主改为服务用户，避免以 root 家目录落日志。
+>
+> 若代码目录所在路径服务用户不可读，安装时会给出提示，请把仓库放到共享路径（如 `/opt/clipshare`）。
+> 日志：`journalctl -u clipshare -f`。
 
 ### Windows
 

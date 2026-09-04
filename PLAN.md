@@ -30,8 +30,8 @@ clipshare：局域网多主机剪贴板共享（Windows / Linux 同一份 Python
 
 - [ ] **P0-部署收尾**：宿主 A 重启 clipshare 服务，加载 x11py 图片后端；随后做生产网格 A→B 截图发送回归（沙箱无法重启宿主进程，需宿主本机执行 `systemctl --user restart clipshare`）
 - [ ] **P0-Windows 实机验证**：在有 Windows 主机后，实测计划任务/NSSM 服务脚本、CF_HDROP 文件剪贴板、CF_DIB 图片剪贴板、日志功能；结果记入 TEST_REPORT
-- [ ] **P1-系统级服务增强**：`install_linux_service.sh install --system` 增加交互式/自动配置 `User=`、`DISPLAY=`、`XAUTHORITY=`、`XDG_RUNTIME_DIR=` 引导，减少手动配置出错
-- [ ] **P1-日志落点明确**：系统级服务单元默认追加 `--log-dir`（避免 root 家目录下产生日志），并在 README 说明
+- [X] **P1-系统级服务增强**：`install_linux_service.sh install --system` 自动配置 `User=`、会话环境变量、`--log-dir`/`--recv-dir`，新增 `preview` 动作，免去手工配置
+- [X] **P1-日志落点明确**：系统级服务单元默认追加 `--log-dir`（避免 root 家目录产生日志），自动创建并 chown 目录；README 已更新
 
 ### 2.2 中期（平台完善）
 
@@ -59,8 +59,8 @@ clipshare：局域网多主机剪贴板共享（Windows / Linux 同一份 Python
 | BUG-001 | 宿主 A 服务仍运行旧代码，x11py 截图后端未生效 | 高 | 待办 | 沙箱无法重启宿主进程；宿主执行 `systemctl --user restart clipshare` 后回归 |
 | BUG-002 | Windows 服务化脚本（计划任务/NSSM）未实机验证 | 高 | 待办 | 需 Windows 实机；含 -Restart 分支 |
 | BUG-003 | Windows 原生文件/图片剪贴板（CF_HDROP/CF_DIB）未实机回归 | 高 | 待办 | 需 Windows 实机 |
-| BUG-004 | 系统级服务需手动配置图形会话环境变量，易出错 | 中 | 待办 | 计划在 install 脚本增加自动引导（P1） |
-| BUG-005 | 系统级服务（root）日志落点不明确 | 中 | 待办 | 默认在 root 家目录 logs/，计划追加 --log-dir（P1） |
+| BUG-004 | 系统级服务需手动配置图形会话环境变量，易出错 | 中 | 已修复 | `install --system` 自动探测并写入 `User=`/会话环境；新增 `preview` 动作与 `--user`/`--log-dir`/`--recv-dir` 参数 |
+| BUG-005 | 系统级服务（root）日志落点不明确 | 中 | 已修复 | 单元自动追加 `--log-dir`/`--recv-dir`，目录自动创建并 chown 给服务用户 |
 | BUG-006 | 认证/传输安全待评估 | 中 | 待办 | 口令为 SHA-256 比对，传输通道加密方案待确认与实现 |
 | BUG-007 | 自定义端口时显式 `--peer` 连接端口取本地端口 | 低 | 已知行为 | 各节点需统一端口；README 已说明，文档可再强调 |
 
