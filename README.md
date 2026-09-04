@@ -219,6 +219,9 @@ python clipshare.py --log-dir ""
 
 > 作为 systemd 服务运行时，`journalctl --user -u clipshare -f` 与 `/var/log/clipshare/clipshare.log`
 > 文件会同时记录，互不冲突。
+>
+> Windows 无 `/var/log`，默认写入仓库内 `logs\clipshare.log`（计划任务 `WorkingDirectory` 为仓库目录，
+> 故落点为 `<仓库>\logs`）；`--log-dir` 规则与 Linux 一致。
 
 ## 工作原理
 

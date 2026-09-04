@@ -244,3 +244,55 @@
 2. **生产网格 A→B 截图发送路径通过**：A 侧剪贴板图片被服务检测并以 PNG 发送至全部对端（含 B），A 侧证据充分。
 3. **遗留**：B 侧收图目视确认（B 的 Wayland 剪贴板 `wl-paste --type image/png` 或 recv 目录）需在有 B 访问权限时核对；
    测试 PNG 源文件保留在 `/tmp/cs_a2b_test.png`（MD5 `becdedff348969b089f4dcb408838474`）可供比对。
+
+---
+
+## Part 5 Windows 实机验证清单（2026-09-04 编制，待实机执行）
+
+> 当前无 Windows 主机，Part 5 先完成**静态审查 + 验证清单编制**，便于拿到 Windows 实机后逐项勾选。
+> 与本次配套的变更：修复 Windows 默认日志目录（`/var/log/clipshare` 为 Linux 路径，Windows 改为仓库内 `logs/`）。
+
+### 5.1 静态审查结论
+
+| 项 | 结论 |
+|---|---|
+| `install_windows_service.ps1` | 无阻断问题。`Get-PythonW` 通配探测 + PATH 兜底；计划任务设置 `-Hidden`、电池感知、失败自重启 3 次（间隔 1 分钟）、执行时长无限；`-Principal Interactive + RunLevel Limited` 无需管理员；`-Install/-Restart/-Status/-Uninstall` 分支完整 |
+| CF_HDROP（文件） | `_win_get_files`/`_win_set_files` 结构正确：`DROPFILES` 布局、UTF-16-LE 宽字符、`OpenClipboard`/`CloseClipboard` 成对、`SetClipboardData` 后不误释放句柄（所有权移交剪贴板） |
+| CF_DIB（图片） | `_dib_to_png` 正确解析 BITMAPINFOHEADER（支持 1/4/8/24/32 bpp、调色板、自底向上翻转）；`_png_to_dib` 用 Pillow 转 RGBA→BMP 后剥离 14 字节文件头。Windows 图片后端依赖 Pillow，缺失时降级为保存 PNG 到 recv 目录 |
+| 回环防护 | 接收文件/图片放回剪贴板后，轮询器用 `recv_clip_sig()`/`recv_image_sig()` 比对签名，避免把“刚收到的”内容回传给对端，与 Linux 路径共用同一逻辑 |
+| 日志落点 | 修复前默认 `/var/log/clipshare` 在 Windows 会解析为 `C:\var\log\clipshare`；已按平台区分，Windows 默认 `logs/`（计划任务 `WorkingDirectory` 为仓库目录，故落点为 `<仓库>\logs\clipshare.log`） |
+
+### 5.2 Windows 实机验证清单（执行后逐项记录结果）
+
+**A. 服务化（计划任务方案）**
+- [ ] `powershell -ExecutionPolicy Bypass -File install_windows_service.ps1 -Install`
+- [ ] `-Status` 显示任务存在、`LastTaskResult == 0`、`LastRunTime` 为最近
+- [ ] 任务使用 `pythonw.exe`（无控制台窗口）；进程列表中存在 `pythonw.exe` 且无报错
+- [ ] 剪贴板同步可用（见 D）；`-Restart` 后功能恢复
+- [ ] `-Uninstall` 后任务移除、进程停止
+- [ ] 服务重启/异常退出后自动拉起（任务设置 `RestartCount 3`）——可手动 Kill 进程观察
+
+**B. 服务化（NSSM 真服务方案，可选）**
+- [ ] NSSM 注册服务并随系统启动（`Services.msc` 可见 clipshare 服务）
+- [ ] 服务状态下剪贴板同步可用
+
+**C. 日志**
+- [ ] 默认日志写入 `<仓库>\logs\clipshare.log`（非 `C:\var\log\clipshare`）
+- [ ] 日志含时间戳前缀，启动横幅显示剪贴板后端状态
+- [ ] `--log-dir ""` 可关闭文件日志；`--log-dir <dir>` 可改目录
+
+**D. 功能回归（Windows ↔ Linux / Windows ↔ Windows）**
+- [ ] 文本剪贴板：Windows 复制 → Linux 粘贴；反向亦然（双向）
+- [ ] 文件 CF_HDROP：Windows 资源管理器复制文件 → Linux 收到到 recv；反向 Linux 复制 → Windows 粘贴可用
+- [ ] 文件夹 CF_HDROP：Windows 复制文件夹 → Linux 重建目录树
+- [ ] 图片 CF_DIB：Windows 截图（Win+Shift+S）→ Linux 收到 PNG；反向 Linux 复制图片 → Windows 剪贴板可粘贴
+- [ ] 回环防护：双向无重复回传/无限循环
+
+**E. 密码认证（可选）**
+- [ ] 两端 `--password` 一致可互通；不一致被拒绝并告警
+
+### 5.3 结论与遗留
+
+- 静态审查未发现 Windows 侧功能阻断问题；`install_windows_service.ps1` 与 CF_HDROP/CF_DIB 实现结构正确。
+- 本次修复一处跨平台回归：Windows 默认日志目录由 `/var/log/clipshare` 改为 `logs/`。
+- **遗留**：以上 5.2 清单待 Windows 实机执行后逐项补记结果，并将结论汇总到本 Part。

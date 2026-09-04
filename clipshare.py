@@ -99,7 +99,13 @@ def _handle_signal(signum, frame):
 
 
 # -------------------------------- logging --------------------------------- #
-LOG_DEFAULT_DIR = "/var/log/clipshare"  # default system log directory
+# Default system log directory: on Linux /var/log/clipshare (managed by
+# logrotate, follows the system log policy); on Windows there is no /var/log,
+# so fall back to a repo-local "logs/" directory.
+if sys.platform == "win32":
+    LOG_DEFAULT_DIR = "logs"
+else:
+    LOG_DEFAULT_DIR = "/var/log/clipshare"
 LOG_FILE_NAME = "clipshare.log"          # active log file (logrotate rotates it)
 LOG_RETENTION_DAYS = 31       # delete rotated/old log files older than this
 
