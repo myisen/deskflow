@@ -28,7 +28,7 @@ clipshare：局域网多主机剪贴板共享（Windows / Linux 同一份 Python
 
 ### 2.1 近期（当前阶段，优先推进）
 
-- [ ] **P0-部署收尾**：宿主 A 重启 clipshare 服务，加载 x11py 图片后端；随后做生产网格 A→B 截图发送回归（沙箱无法重启宿主进程，需宿主本机执行 `systemctl --user restart clipshare`）
+- [X] **P0-部署收尾**：宿主 A 服务已通过 `systemctl --user restart clipshare` 重启，x11py 图片后端生效（`Picture sync: on (Linux X11 (python-xlib))`）；生产网格 A→B 截图发送回归通过（日志 `[>] Sent image (178 bytes) to 2 peer(s)`，测试 PNG MD5 `becdedff...`）。B 侧目视确认待人工核对（沙箱无 B 访问权限）
 - [ ] **P0-Windows 实机验证**：在有 Windows 主机后，实测计划任务/NSSM 服务脚本、CF_HDROP 文件剪贴板、CF_DIB 图片剪贴板、日志功能；结果记入 TEST_REPORT
 - [X] **P1-系统级服务增强**：`install_linux_service.sh install --system` 自动配置 `User=`、会话环境变量、`--log-dir`/`--recv-dir`，新增 `preview` 动作，免去手工配置
 - [X] **P1-日志落点明确**：系统级服务单元默认追加 `--log-dir`（避免 root 家目录产生日志），自动创建并 chown 目录；README 已更新
@@ -56,7 +56,7 @@ clipshare：局域网多主机剪贴板共享（Windows / Linux 同一份 Python
 
 | ID | 标题 | 严重度 | 状态 | 备注 |
 |---|---|---|---|---|
-| BUG-001 | 宿主 A 服务仍运行旧代码，x11py 截图后端未生效 | 高 | 待办 | 沙箱无法重启宿主进程；宿主执行 `systemctl --user restart clipshare` 后回归 |
+| BUG-001 | 宿主 A 服务仍运行旧代码，x11py 截图后端未生效 | 高 | 已修复 | 宿主用户总线执行 `systemctl --user restart clipshare` 后 x11py 生效（启动横幅 `Picture sync: on (Linux X11 (python-xlib))`）；生产网格 A→B 截图发送回归通过 |
 | BUG-002 | Windows 服务化脚本（计划任务/NSSM）未实机验证 | 高 | 待办 | 需 Windows 实机；含 -Restart 分支 |
 | BUG-003 | Windows 原生文件/图片剪贴板（CF_HDROP/CF_DIB）未实机回归 | 高 | 待办 | 需 Windows 实机 |
 | BUG-004 | 系统级服务需手动配置图形会话环境变量，易出错 | 中 | 已修复 | `install --system` 自动探测并写入 `User=`/会话环境；新增 `preview` 动作与 `--user`/`--log-dir`/`--recv-dir` 参数 |

@@ -1,8 +1,10 @@
 # clipshare 测试报告
 
-> 本报告包含两部分：
+> 本报告包含四部分：
 > - **Part 1**：Linux ↔ Linux 剪贴板同步功能测试（2026-09-01）
 > - **Part 2**：服务化启动（systemd / Windows 计划任务）功能测试（2026-09-02）
+> - **Part 3**：截图（剪贴板图片）传输测试（2026-09-02）
+> - **Part 4**：P0 部署收尾 —— 宿主 A 服务重启 + 生产网格 A→B 截图发送回归（2026-09-04）
 
 ---
 
@@ -139,7 +141,7 @@
 4. **日志**：`PYTHONUNBUFFERED=1` 保证 `journalctl --user -u clipshare -f` 实时可见日志。
 5. **已知限制**：
    - Windows 侧脚本（计划任务 / NSSM）未在真实 Windows 主机上执行，仅提供与文档化；首次部署建议先 `-Status` 确认任务创建成功。
-   - 系统级服务（`install --system`）以 root 运行且无图形会话，需按 README 说明补充 `User=`/`DISPLAY=`/`XAUTHORITY=` 等变量后方可读写剪贴板。
+   - 系统级服务（`install --system`）自动探测桌面用户与图形会话环境（P1 已实现并提交 e431b00），详见 README。
 
 ### 遗留事项
 
@@ -189,12 +191,56 @@
 2. **双向链路完整**：X11(x11py) ↔ Wayland(wl) 之间 PNG 传输、解码、剪贴板放回均正确。
 3. **无副作用**：图片占位不影响文本轮询，回环防护正常，文本同步无回归。
 4. **已知限制**：
-   - 本机宿主 A 的服务仍运行旧代码（沙箱无法重启宿主进程），x11py 图片后端需宿主下次重启服务后生效；其在沙箱内的实机验证已通过（同一 X 显示）。
    - 截图传输依赖截图工具把 PNG 放进系统剪贴板（与现有文本/图片同步一致的触发方式）。
+   - （原“宿主 A 服务未加载 x11py”限制已解除，见 Part 4。）
 
 ### 遗留事项
 
-- **本机宿主 A 服务需重启以加载 x11py 后端**（沙箱无法重启宿主进程）。宿主上执行
-  `systemctl --user restart clipshare`（或 `./install_linux_service.sh restart`）后，
-  A 端即具备截图的收发能力（发送路径已在隔离网格中以同一 X 显示实机验证通过；
-  生产网格接收路径已实测通过，见用例 7）。
+- **本机宿主 A 服务已重启并加载 x11py 后端**（2026-09-04，见 Part 4）：
+  `systemctl --user restart clipshare` 后启动横幅显示 `Picture sync: on (Linux X11 (python-xlib))`，
+  生产网格 A→B 截图发送回归通过；发送路径此前已在隔离网格（32621）中以同一 X 显示实机验证。
+- 生产网格 B→A 接收路径已实测通过（见用例 7）。
+
+---
+
+## Part 4 P0 部署收尾 —— 宿主 A 服务重启 + 生产网格 A→B 截图发送回归（2026-09-04）
+
+- 测试时间：2026-09-04 10:42 ~ 10:45
+- 测试对象：宿主 A 的 systemd 用户服务重启后加载 x11py 图片后端，随后在生产网格（32620）做 A→B 截图发送回归
+- 前置：BUG-001 —— 宿主 A 服务启动时 X 连接失败，`Picture sync: unavailable`，x11py 未生效
+- 触发方式：宿主 A 的 X11 剪贴板写入测试 PNG（96×64、178B、MD5 `becdedff348969b089f4dcb408838474`），
+  与真实“截图复制到剪贴板”触发路径一致
+
+### 操作
+
+1. 通过宿主用户总线重启服务：`systemctl --user restart clipshare`
+   （服务单元已含 `DISPLAY=:0`/`XAUTHORITY=/home/user/.Xauthority`，重启后 X 连接成功，x11py 生效）
+2. 用 x11py 机制（`ImageClipboard.set_image`）把测试 PNG 写入宿主 A 剪贴板，保持所有者存活 5s 供服务轮询
+
+### 测试用例与结果
+
+| # | 项 | 结果 | 说明 / 证据 |
+|---|---|---|---|
+| 1 | 服务重启后 x11py 后端加载 | ✅ 通过 | 重启后启动横幅：`Local IP: 10.180.15.216`、`Copy/paste file sync: on (Linux X11 (built-in python-xlib))`、`Picture sync: on (Linux X11 (python-xlib))` |
+| 2 | 生产网格 A→B 截图发送 | ✅ 通过（A 侧） | A 侧 X11 剪贴板写入 178B PNG → 服务检测并发送：日志 `[>] Sent image (178 bytes) to 2 peer(s)`，字节数与源 PNG 一致；B 侧目视确认待人工核对（沙箱无 B 访问权限） |
+| 3 | 生产网格连通性 | ✅ 通过 | 重启后自动发现并连接 2 对端：`Mesh: connected to 2 peer(s): 10.180.15.233, 10.180.15.251` |
+
+### 关键日志摘录（宿主 A）
+
+```
+2026-09-04 10:42:06 [*] clipshare v0.3
+2026-09-04 10:42:06 [*] Local IP: 10.180.15.216  TCP port: 32620
+2026-09-04 10:42:06 [*] Copy/paste file sync: on (Linux X11 (built-in python-xlib))
+2026-09-04 10:42:06 [*] Picture sync: on (Linux X11 (python-xlib))
+2026-09-04 10:42:08 [+] Connected to 10.180.15.251:32620
+2026-09-04 10:42:10 [*] Mesh: connected to 2 peer(s): 10.180.15.233, 10.180.15.251
+2026-09-04 10:44:38 [>] Sent image (178 bytes) to 2 peer(s)
+```
+
+### 结论
+
+1. **BUG-001 已解决**：宿主 A 服务重启后 x11py 图片后端生效，`Picture sync: on (Linux X11 (python-xlib))`，
+   `Local IP` 亦恢复为 `10.180.15.216`（此前启动时显示 127.0.0.1）。
+2. **生产网格 A→B 截图发送路径通过**：A 侧剪贴板图片被服务检测并以 PNG 发送至全部对端（含 B），A 侧证据充分。
+3. **遗留**：B 侧收图目视确认（B 的 Wayland 剪贴板 `wl-paste --type image/png` 或 recv 目录）需在有 B 访问权限时核对；
+   测试 PNG 源文件保留在 `/tmp/cs_a2b_test.png`（MD5 `becdedff348969b089f4dcb408838474`）可供比对。
