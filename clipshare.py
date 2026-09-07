@@ -415,6 +415,7 @@ class FileClipboard:
         kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
         kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
         user32.SetClipboardData.restype = wintypes.HANDLE
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
 
         files_str = "".join(p + "\0" for p in paths) + "\0"
         files_bytes = files_str.encode("utf-16-le")
@@ -575,7 +576,9 @@ class ImageClipboard:
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         user32.GetClipboardData.restype = wintypes.HANDLE
-        kernel32.GlobalSize.restype = wintypes.SIZE_T
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        kernel32.GlobalSize.restype = ctypes.c_size_t
+        kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
         kernel32.GlobalLock.restype = wintypes.LPVOID
         kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
         kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
@@ -611,12 +614,13 @@ class ImageClipboard:
         kernel32 = ctypes.windll.kernel32
         user32 = ctypes.windll.user32
         kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
-        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, wintypes.SIZE_T]
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
         kernel32.GlobalLock.restype = wintypes.LPVOID
         kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
         kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
         kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
         user32.SetClipboardData.restype = wintypes.HANDLE
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
         h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(dib))
         if not h:
             return False
