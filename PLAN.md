@@ -30,7 +30,7 @@ clipshare：局域网多主机剪贴板共享（Windows / Linux 同一份 Python
 ### 2.1 近期（当前阶段，优先推进）
 
 - [X] **P0-部署收尾**：宿主 A 服务已通过 `systemctl --user restart clipshare` 重启，x11py 图片后端生效（`Picture sync: on (Linux X11 (python-xlib))`）；生产网格 A→B 截图发送回归通过（日志 `[>] Sent image (178 bytes) to 2 peer(s)`，测试 PNG MD5 `becdedff...`）。B 侧目视确认待人工核对（沙箱无 B 访问权限）
-- [ ] **P0-Windows 实机验证**：验证清单已编制并完成静态审查（TEST_REPORT Part 5）；待 Windows 实机后逐项执行——计划任务/NSSM 服务、CF_HDROP 文件、CF_DIB 图片、日志；准备期间已修复 Windows 默认日志目录回归（BUG-008）
+- [ ] **P0-Windows 实机验证**：验证清单已编制并完成静态审查（TEST_REPORT Part 5）；**代码已就绪并交由用户在 Windows 平台实机验证/测试/完善（2026-09-04 交接）**——计划任务/NSSM 服务、CF_HDROP 文件、CF_DIB 图片、日志；准备期间已修复 Windows 默认日志目录回归（BUG-008），并新增运维命令（`--status`/`--peer-*`）
 - [X] **P1-系统级服务增强**：`install_linux_service.sh install --system` 自动配置 `User=`、会话环境变量、`--log-dir`/`--recv-dir`，新增 `preview` 动作，免去手工配置
 - [X] **P1-日志落点明确**：系统级服务单元默认追加 `--log-dir`（避免 root 家目录产生日志），自动创建并 chown 目录；README 已更新
 - [X] **P1-日志模块完善**：默认日志目录改为 `/var/log/clipshare`，固定单一日志文件 `clipshare.log`（logrotate 友好）；安装服务时自动写入 `/etc/logrotate.d/clipshare`（按天轮转、压缩、保留 30 天并自动清理过期日志，跟随系统日志清理机制）；非 root/手动运行不可写时自动回退 `logs/`，启动时兜底清理超 31 天旧日志

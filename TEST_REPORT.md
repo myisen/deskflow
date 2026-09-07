@@ -249,9 +249,10 @@
 
 ---
 
-## Part 5 Windows 实机验证清单（2026-09-04 编制，待实机执行）
+## Part 5 Windows 实机验证清单（2026-09-04 编制，交由用户在 Windows 实机执行）
 
-> 当前无 Windows 主机，Part 5 先完成**静态审查 + 验证清单编制**，便于拿到 Windows 实机后逐项勾选。
+> 当前无 Windows 主机，Part 5 先完成**静态审查 + 验证清单编制**，代码已就绪，交由用户在 Windows
+> 平台实机验证、测试与完善，完成后逐项补记结果。
 > 与本次配套的变更：修复 Windows 默认日志目录（`/var/log/clipshare` 为 Linux 路径，Windows 改为仓库内 `logs/`）。
 
 ### 5.1 静态审查结论
