@@ -21,6 +21,7 @@ clipshare：局域网多主机剪贴板共享（Windows / Linux 同一份 Python
 | Linux 服务化 | systemd 用户级/系统级服务：`install_linux_service.sh {install|status|restart|uninstall} [--system]`，支持图形会话环境自动探测、SIGTERM/SIGHUP 优雅退出 |
 | Windows 服务化 | 计划任务（pythonw 静默后台、异常自重启）+ NSSM 真服务方案：`install_windows_service.ps1 -Install/-Restart/-Status/-Uninstall` |
 | 测试与文档 | `TEST_REPORT.md` 记录各阶段实机测试；README 中英双语 |
+| 运维命令 | 显式对端持久化到 `peers.conf`（`--peer-add`/`--peer-del`/`--peer-list`，启动时与 `--peer` 合并）；`--status` 不启动守护进程即可输出版本/IP/端口/认证/后端/运行状态与已连接对端（依赖守护进程写入的 `clipshare.status` 快照） |
 
 ---
 
@@ -29,16 +30,16 @@ clipshare：局域网多主机剪贴板共享（Windows / Linux 同一份 Python
 ### 2.1 近期（当前阶段，优先推进）
 
 - [X] **P0-部署收尾**：宿主 A 服务已通过 `systemctl --user restart clipshare` 重启，x11py 图片后端生效（`Picture sync: on (Linux X11 (python-xlib))`）；生产网格 A→B 截图发送回归通过（日志 `[>] Sent image (178 bytes) to 2 peer(s)`，测试 PNG MD5 `becdedff...`）。B 侧目视确认待人工核对（沙箱无 B 访问权限）
-- [ ] **P0-Windows 实机验证**：验证清单已编制并完成静态审查（TEST_REPORT Part 5）；待 Windows 实机后逐项执行——计划任务/NSSM 服务、CF_HDROP 文件、CF_DIB 图片、日志；准备期间已修复 Windows 默认日志目录回归（BUG-008）
+- [ ] **P0-Windows 实机验证**：验证清单已编制并完成静态审查（TEST_REPORT Part 5）；**代码已就绪并交由用户在 Windows 平台实机验证/测试/完善（2026-09-04 交接）**——计划任务/NSSM 服务、CF_HDROP 文件、CF_DIB 图片、日志；准备期间已修复 Windows 默认日志目录回归（BUG-008），并新增运维命令（`--status`/`--peer-*`）
 - [X] **P1-系统级服务增强**：`install_linux_service.sh install --system` 自动配置 `User=`、会话环境变量、`--log-dir`/`--recv-dir`，新增 `preview` 动作，免去手工配置
 - [X] **P1-日志落点明确**：系统级服务单元默认追加 `--log-dir`（避免 root 家目录产生日志），自动创建并 chown 目录；README 已更新
 - [X] **P1-日志模块完善**：默认日志目录改为 `/var/log/clipshare`，固定单一日志文件 `clipshare.log`（logrotate 友好）；安装服务时自动写入 `/etc/logrotate.d/clipshare`（按天轮转、压缩、保留 30 天并自动清理过期日志，跟随系统日志清理机制）；非 root/手动运行不可写时自动回退 `logs/`，启动时兜底清理超 31 天旧日志
+- [X] **P1-可运维性**：显式对端持久化 `peers.conf`（`--peer-add`/`--peer-del`/`--peer-list`，启动时与 `--peer` 合并去重）；新增 `--status` 单机状态查询（不启动守护进程，输出网格/后端/运行状态，依赖 `clipshare.status` 快照）；accept 路径忽略本机回环/自身 IP 的非显式探针连接，避免 `--status` 健康检查污染网格
 
 ### 2.2 中期（平台完善）
 
 - [ ] 安全增强：评估并实现传输通道加密（如 TLS/对称加密），认证口令加盐存储与比对
 - [ ] 性能：多实例/大网格压测；大文件分片传输与断点续传
-- [ ] 可运维性：交互式对端管理（添加/移除/查看 `--peer`）、单机状态查询命令（`--status` 输出网格与后端状态）
 - [ ] 跨平台打包：PyInstaller 产出 Windows exe / Linux 可执行文件，简化部署（免装 Python）
 - [ ] 服务化监控：systemd 单元增加 `Restart=always` 策略评估、异常退出告警
 

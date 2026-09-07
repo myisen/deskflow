@@ -43,6 +43,7 @@ Dependencies
 
 import argparse
 import hashlib
+import json
 import os
 import socket
 import struct
@@ -75,6 +76,14 @@ TYPE_CLIPFILES = 0x04      # payload = COUNT(2) + [NAMELEN(2)+name+DATALEN(8)+da
 TYPE_IMAGE = 0x05          # payload = PNG image bytes
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB safety cap for a single file
 DEFAULT_RECV_DIR = "clipshare_recv"     # where received files are stored
+
+# --------------------------------------------------------------------------- #
+# Operational files live next to the script (repo), so they work regardless of
+# CWD (systemd service, scheduled task, manual run).
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PEERS_CONF = os.path.join(SCRIPT_DIR, "peers.conf")      # persisted explicit peers
+STATUS_FILE = os.path.join(SCRIPT_DIR, "clipshare.status")  # daemon status snapshot
+STATUS_FRESH_SECS = 120       # a status snapshot older than this is "stale"
 SEND_FILE_WAIT = 15.0      # seconds to wait for a peer before sending a file
 FILE_POLL_INTERVAL = 1.0   # seconds between "copied files" clipboard polls
 IMAGE_POLL_INTERVAL = 0.5  # seconds between "copied image" clipboard polls
@@ -119,6 +128,12 @@ class Clipboard:
             return False
         except Exception:
             return False
+
+    def describe(self):
+        return {
+            "pyperclip": "pyperclip (external xclip/xsel/wl-clipboard)",
+            "x11": "Linux X11 (built-in python-xlib)",
+        }.get(self._backend, "unavailable on this system")
 
     def _warn_once(self):
         if not self._warn_printed:
@@ -798,6 +813,39 @@ class PeerNet:
         print(f"[+] Connected to {peer_ip}:{self.port}")
         return True
 
+    def _log_mesh_status(self):
+        """Print how many peers we are currently connected to (full mesh)."""
+        with self._lock:
+            peers = sorted(self.connections)
+        if peers:
+            print(f"[*] Mesh: connected to {len(peers)} peer(s): "
+                  f"{', '.join(peers)}")
+        else:
+            print("[*] Mesh: no peers connected")
+        self._write_status()
+
+    def _write_status(self):
+        """Snapshot current state for the '--status' diagnostic (best effort)."""
+        try:
+            import json as _json
+            with self._lock:
+                peers = sorted(self.connections)
+            info = {
+                "pid": os.getpid(),
+                "version": __version__,
+                "ip": self.my_ip,
+                "port": self.port,
+                "connected": peers,
+                "auth": self._pw_hash is not None,
+                "ts": time.time(),
+            }
+            tmp = STATUS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(info, f)
+            os.replace(tmp, STATUS_FILE)
+        except Exception:
+            pass  # best effort; --status falls back to a port check
+
     def _enable_keepalive(self, sock):
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -868,6 +916,16 @@ class PeerNet:
             except Exception:
                 break
             peer_ip = addr[0]
+            # Ignore probe connections from our own machine (e.g. the
+            # '--status' health check) unless the address is an explicit peer
+            # (covers same-host multi-instance test setups).
+            if peer_ip in ("127.0.0.1", "::1") or peer_ip == self.my_ip:
+                if peer_ip not in self.peers:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    continue
             if self.peers and peer_ip not in self.peers:
                 conn.close()
                 continue
@@ -1182,9 +1240,102 @@ class PeerNet:
         threading.Thread(target=self._server_loop, daemon=True).start()
         threading.Thread(target=self._discovery_loop, daemon=True).start()
         threading.Thread(target=self._announce_loop, daemon=True).start()
+        self._write_status()
 
 
 # -------------------------------- main ------------------------------------ #
+# --------------------------- operational helpers --------------------------- #
+def _load_peers_conf():
+    """Explicit peers persisted in peers.conf (one IP/host per line)."""
+    peers = []
+    try:
+        with open(PEERS_CONF, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and line not in peers:
+                    peers.append(line)
+    except OSError:
+        pass
+    return peers
+
+def _save_peers_conf(peers):
+    with open(PEERS_CONF, "w", encoding="utf-8") as f:
+        f.write("\n".join(peers) + ("\n" if peers else ""))
+
+def _valid_peer(peer):
+    """Accept an IPv4/IPv6 address or a hostname; reject obvious junk."""
+    peer = peer.strip()
+    if not peer or any(c in peer for c in " \t,"):
+        return False
+    try:
+        import ipaddress
+        ipaddress.ip_address(peer)
+        return True
+    except ValueError:
+        pass
+    return all(c.isalnum() or c in "-._" for c in peer)
+
+def _read_status(port):
+    """Return (running, snapshot) for the --status command.
+
+    ``running`` is authoritative (TCP connect to our own port). ``snapshot``
+    is the daemon's last status file (None if absent/stale).
+    """
+    snapshot = None
+    try:
+        with open(STATUS_FILE, encoding="utf-8") as f:
+            snapshot = json.load(f)
+        if time.time() - snapshot.get("ts", 0) > STATUS_FRESH_SECS:
+            snapshot = None
+    except (OSError, ValueError):
+        snapshot = None
+    s = socket.socket()
+    s.settimeout(1.0)
+    try:
+        s.connect(("127.0.0.1", port))
+        running = True
+    except OSError:
+        running = False
+    finally:
+        s.close()
+    return running, snapshot
+
+def _cmd_status(args):
+    print(f"[*] clipshare v{__version__}")
+    print(f"[*] Local IP: {get_local_ip()}  TCP port: {args.port}")
+    print(f"[*] Auth: {'on (SHA-256)' if args.password else 'off'}")
+    peers = _load_peers_conf()
+    if peers:
+        print(f"[*] Peers (peers.conf): {', '.join(peers)}")
+    elif args.peer:
+        print(f"[*] Peers (--peer): {', '.join(args.peer)}")
+    else:
+        print("[*] Peers: auto-discovery (LAN broadcast)")
+    for label, obj in (("Text backend ", Clipboard()),
+                       ("File backend ", FileClipboard()),
+                       ("Image backend", ImageClipboard())):
+        try:
+            print(f"[*] {label}: {obj.describe()}")
+        except Exception as e:
+            print(f"[*] {label}: error ({e})")
+    running, snapshot = _read_status(args.port)
+    if running and snapshot:
+        up = max(0, int(time.time() - snapshot["ts"]))
+        peers_now = snapshot.get("connected") or []
+        print(f"[*] Daemon: running (pid {snapshot['pid']}, "
+              f"snapshot {up}s ago)")
+        if peers_now:
+            print(f"[*] Mesh: connected to {len(peers_now)} peer(s): "
+                  f"{', '.join(peers_now)}")
+        else:
+            print("[*] Mesh: no peers connected")
+    elif running:
+        print("[*] Daemon: running (port listening; no fresh status snapshot)")
+    else:
+        print("[*] Daemon: not running")
+    print(f"[*] Log dir: {args.log_dir or LOG_DEFAULT_DIR!r}  "
+          f"Recv dir: {os.path.abspath(args.recv_dir)}")
+
 def main():
     parser = argparse.ArgumentParser(description="LAN clipboard sharing")
     parser.add_argument("--peer", action="append", default=[],
@@ -1207,16 +1358,70 @@ def main():
                              "peers, ready to paste).")
     parser.add_argument("--no-image", action="store_true",
                         help="Disable picture (clipboard image) syncing.")
+    parser.add_argument("--log-dir", default=None, metavar="DIR",
+                        help=f"Directory for the log file "
+                             f"(default: {LOG_DEFAULT_DIR!r}, falling back to "
+                             f"logs/ when not writable); pass an empty string "
+                             f"to disable file logging.")
+    parser.add_argument("--peer-add", metavar="IP", default=None,
+                        help="Persist an explicit peer IP/host to peers.conf "
+                             "and exit (used together with --peer at startup).")
+    parser.add_argument("--peer-del", metavar="IP", default=None,
+                        help="Remove a peer IP/host from peers.conf and exit.")
+    parser.add_argument("--peer-list", action="store_true",
+                        help="List peers persisted in peers.conf and exit.")
+    parser.add_argument("--status", action="store_true",
+                        help="Show local status (mesh, backends, config) and "
+                             "exit without starting the daemon.")
     parser.add_argument("--version", action="version",
                         version=f"clipshare {__version__}")
     args = parser.parse_args()
 
+    # ---- operational subcommands (no daemon is started) ------------------ #
+    if args.peer_list:
+        peers = _load_peers_conf()
+        if peers:
+            print("[*] peers.conf:")
+            for p in peers:
+                print(f"    {p}")
+        else:
+            print("[*] peers.conf is empty (auto-discovery only)")
+        return
+    if args.peer_add is not None:
+        if not _valid_peer(args.peer_add):
+            raise SystemExit(f"[!] --peer-add: invalid IP/host: {args.peer_add!r}")
+        peers = _load_peers_conf()
+        if args.peer_add not in peers:
+            peers.append(args.peer_add)
+            _save_peers_conf(peers)
+        print(f"[*] peers.conf: added {args.peer_add} "
+              f"({len(peers)} peer(s) total)")
+        return
+    if args.peer_del is not None:
+        peers = _load_peers_conf()
+        if args.peer_del in peers:
+            peers.remove(args.peer_del)
+            _save_peers_conf(peers)
+            print(f"[*] peers.conf: removed {args.peer_del} "
+                  f"({len(peers)} peer(s) remaining)")
+        else:
+            print(f"[!] peers.conf: {args.peer_del!r} not present")
+        return
+    if args.status:
+        _cmd_status(args)
+        return
+
+    setup_logging(args.log_dir)
+
     if args.send_file and not os.path.isfile(args.send_file):
         raise SystemExit(f"[!] --send-file: not a file: {args.send_file!r}")
 
-    peers = []
+    # Persisted peers (peers.conf) + CLI --peer flags are merged.
+    peers = _load_peers_conf()
     for item in args.peer:
         peers.extend(p.strip() for p in item.split(",") if p.strip())
+    seen = set()
+    peers = [p for p in peers if not (p in seen or seen.add(p))]
 
     clip = Clipboard()
     net = PeerNet(args.port, peers, clip, password=args.password,
@@ -1300,6 +1505,10 @@ def main():
     finally:
         _running.clear()
         print("\n[*] Stopped.")
+        try:
+            os.remove(STATUS_FILE)  # daemon is gone; drop the stale snapshot
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
