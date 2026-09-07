@@ -66,6 +66,7 @@ clipshare：局域网多主机剪贴板共享（Windows / Linux 同一份 Python
 | BUG-006 | 认证/传输安全待评估 | 中 | 待办 | 口令为 SHA-256 比对，传输通道加密方案待确认与实现 |
 | BUG-007 | 自定义端口时显式 `--peer` 连接端口取本地端口 | 低 | 已知行为 | 各节点需统一端口；README 已说明，文档可再强调 |
 | BUG-008 | Windows 默认日志目录误用 `/var/log/clipshare` | 中 | 已修复 | 日志模块改造后默认值为 Linux 路径，Windows 会解析为 `C:\var\log\clipshare`；改为按平台区分，Windows 默认仓库内 `logs/`（clipshare.py `LOG_DEFAULT_DIR` 平台判断） |
+| BUG-009 | 合并回归导致启动 NameError | 高 | 已修复 | Windows 侧旧副本提交（f5ea7c1）整体回退了日志模块与 signal 处理，合并后服务崩溃循环（`LOG_DEFAULT_DIR is not defined`）；已从 4eba0c8 恢复 clipshare.py/README.md 完整版本，并重新合入 Windows 真实修复（81459e3 ctypes argtypes：`SetClipboardData/GetClipboardData.argtypes`、`GlobalSize/GlobalAlloc` 用 `ctypes.c_size_t` 替代 Python 3.12 不可用的 `wintypes.SIZE_T`）；另补 `--status` 快照每 30s 周期刷新，避免长驻服务快照过期 |
 
 ---
 

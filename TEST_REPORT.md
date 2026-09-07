@@ -1,12 +1,13 @@
 # clipshare 测试报告
 
-> 本报告包含六部分：
+> 本报告包含七部分：
 > - **Part 1**：Linux ↔ Linux 剪贴板同步功能测试（2026-09-01）
 > - **Part 2**：服务化启动（systemd / Windows 计划任务）功能测试（2026-09-02）
 > - **Part 3**：截图（剪贴板图片）传输测试（2026-09-02）
 > - **Part 4**：P0 部署收尾 —— 宿主 A 服务重启 + 生产网格 A→B 截图发送回归（2026-09-04）
 > - **Part 5**：Windows 实机验证清单（2026-09-04 编制，待实机执行）
 > - **Part 6**：运维命令测试 —— 对端持久化 + `--status` 状态查询（2026-09-04）
+> - **Part 7**：合并回归修复与生产服务恢复（2026-09-07）
 
 ---
 
@@ -326,4 +327,27 @@
 1. **对端管理**：`--peer-add/-del/-list` 可持久化维护显式对端，服务化部署后无需改服务单元即可增删对端。
 2. **状态查询**：`--status` 不启动守护进程即可输出单机配置、剪贴板后端与守护进程运行状态/网格，便于快速排障。
 3. **无副作用**：健康检查探针已过滤，不会污染组网日志与状态快照；优雅停止会清理状态文件，避免误报“运行中”。
-4. **已知限制**：网格对端列表依赖守护进程写入的 `clipshare.status` 快照（组网变化时刷新，120 秒视为过期）；若守护进程异常强杀（SIGKILL）未删除快照，`--status` 仍以端口探测为准判定“运行中”，并显示快照时间。
+4. **已知限制**：~~网格对端列表依赖守护进程写入的 `clipshare.status` 快照（组网变化时刷新，120 秒视为过期）；若守护进程异常强杀（SIGKILL）未删除快照，`--status` 仍以端口探测为准判定“运行中”，并显示快照时间。~~ 已改进（2026-09-07）：守护进程主循环每 30s 周期刷新快照，长驻服务 `--status` 的网格信息不再过期；SIGKILL 场景端口探测兜底不变。
+
+---
+
+## Part 7 合并回归修复与生产服务恢复（2026-09-07）
+
+- 背景：Windows 侧提交 `f5ea7c1 "turn windows version"` 基于旧副本，整体回退了日志模块与 signal 处理；
+  合并 `ca8b583` 后宿主机 A 的 clipshare 服务进入崩溃循环（`NameError: LOG_DEFAULT_DIR is not defined`，
+  重启计数一度达 80+），32620 端口失守。
+- 修复：
+  1. 从 `4eba0c8` 恢复 `clipshare.py` / `README.md` 完整版本（日志模块、signal、网格、运维命令全量回归）；
+  2. 重新合入 Windows 实机真实修复 `81459e3`：补齐 `SetClipboardData`/`GetClipboardData` 的 `argtypes`，
+     `GlobalSize`/`GlobalAlloc` 改用 `ctypes.c_size_t`（Python 3.12 无 `wintypes.SIZE_T`）；
+  3. 顺带修复 `--status` 快照过期问题：主循环每 30s 周期刷新 `clipshare.status`。
+- 验证：
+  - [x] `py_compile` 通过；`--version` 正常
+  - [x] 修复后服务启动横幅完整：`Copy/paste file sync: on`、`Picture sync: on (Linux X11 (python-xlib))`
+  - [x] 生产网格恢复：`[+] Connected to 10.180.15.251:32620`、`Mesh: connected to 1 peer(s): 10.180.15.251`
+  - [x] 服务持续稳定运行（崩溃循环消除，32620 持续监听）
+  - [x] 快照周期刷新验证：守护进程运行 35s 后快照仅 4.5s 旧，`--status` 显示 `snapshot 4s ago`
+- 遗留：宿主机 A 的 systemd 用户服务运行中进程（pid 4434）为修复后代码（日志模块已生效），
+  但不含最后两次改动（FileClipboard argtypes、快照周期刷新）——这两项在下次服务重启/开机时生效；
+  沙箱内无法访问宿主用户总线（`systemctl --user` / `kill` 受限），重启需在宿主机执行
+  `systemctl --user restart clipshare` 或 `./install_linux_service.sh restart`。

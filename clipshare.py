@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-clipshare - Share the clipboard between two PCs on the same LAN.
+clipshare - Share the clipboard between any number of computers on the same LAN.
 
-The *same* script runs unchanged on Windows and Linux. It auto-discovers the
-peer over a UDP broadcast; if your network blocks broadcasts you can pass
---peer <ip> to connect directly.
+The *same* script runs unchanged on Windows and Linux. It auto-discovers all
+peers over a UDP broadcast; if your network blocks broadcasts you can pass
+--peer <ip> (repeatable) to connect to specific peers directly.
 
 How it works
 ------------
-- Each node runs a TCP server (to receive clipboard updates) and, if it has
-  the "higher" IP, a TCP client (to push updates). This guarantees exactly one
-  connection between the two machines.
+- Every node runs a TCP server (to receive clipboard updates) and, for each
+  peer it learns about, a TCP client (to push updates). Together they form a
+  full mesh; duplicate connections are de-duplicated so there is exactly one
+  connection per peer pair, no matter how many nodes join.
 - A poller watches the local clipboard. When it changes *locally*, the new
-  text is sent to the peer. When an update arrives *from* the peer, it is
-  written to the local clipboard and marked as "remote" so it is not echoed
-  back (no sync loop).
+  text is sent to every connected peer. When an update arrives *from* a peer,
+  it is written to the local clipboard and marked as "remote" so it is not
+  echoed back (no sync loop).
+- Net effect: copy once on any node -> paste on any other node. With N nodes
+  the same clipboard is shared across all of them.
 
 Usage
 -----
@@ -28,6 +31,11 @@ Usage
     python clipshare.py --no-file-clip                   # disable copy/paste of files
     # Copy a picture (e.g. a screenshot) -> it is mirrored to peers, ready to paste.
     python clipshare.py --no-image                       # disable picture syncing
+    # Logs go to /var/log/clipshare by default (fall back to logs/ if not
+    # writable, e.g. a non-root manual run). Rotation/retention is handled by
+    # logrotate (keep 1 month); --log-dir overrides; "" disables file logging.
+    python clipshare.py --log-dir /var/log/clipshare     # custom log directory
+    python clipshare.py --log-dir ""                     # disable file logging
 
 The TCP server binds to 0.0.0.0 on port 32620 by default. When a password is
 set (via --password or CLIPSHARE_PASSWORD) every connection must authenticate
@@ -45,6 +53,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import socket
 import struct
 import subprocess
@@ -93,6 +102,142 @@ _running = threading.Event()
 _running.set()
 
 
+def _handle_signal(signum, frame):
+    """Stop cleanly on SIGTERM/SIGHUP (e.g. systemctl stop / service restart)."""
+    _running.clear()
+
+
+# -------------------------------- logging --------------------------------- #
+# Default system log directory: on Linux /var/log/clipshare (managed by
+# logrotate, follows the system log policy); on Windows there is no /var/log,
+# so fall back to a repo-local "logs/" directory.
+if sys.platform == "win32":
+    LOG_DEFAULT_DIR = "logs"
+else:
+    LOG_DEFAULT_DIR = "/var/log/clipshare"
+LOG_FILE_NAME = "clipshare.log"          # active log file (logrotate rotates it)
+LOG_RETENTION_DAYS = 31       # delete rotated/old log files older than this
+
+
+class _LogStream:
+    """Duplicate every write to a real stream and the log file.
+
+    Wrapping sys.stdout/sys.stderr with this sends the existing print() output
+    to the console *and* the log file (<log_dir>/clipshare.log) without touching
+    the many call sites. The file is opened per write (append), so logrotate may
+    rotate/rename it at any time; the next write simply re-opens the current
+    clipshare.log.
+    """
+
+    def __init__(self, stream, log_dir):
+        self._stream = stream
+        self._log_dir = log_dir
+        self._buf = ""
+
+    def _log_path(self):
+        return os.path.join(self._log_dir, LOG_FILE_NAME)
+
+    def _append_log(self, text):
+        try:
+            with open(self._log_path(), "a", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError:
+            pass  # logging must never crash the daemon
+
+    def write(self, data):
+        try:
+            self._stream.write(data)
+        except Exception:
+            pass
+        if not data:
+            return len(data)
+        # Buffer and emit complete lines, prefixing each non-empty line with
+        # one timestamp. print() may call write() once per argument, so a
+        # whole line ("A B C") is assembled before it is logged.
+        self._buf += data
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line:
+                self._append_log("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                              line))
+            else:
+                self._append_log("\n")  # keep blank lines blank
+        return len(data)
+
+    def flush(self):
+        if self._buf:  # flush any trailing line that has no newline yet
+            self._append_log("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        self._buf))
+            self._buf = ""
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+
+def _cleanup_old_logs(log_dir, days=LOG_RETENTION_DAYS):
+    """Remove rotated log files older than ``days`` days (called at startup).
+
+    Safety net for systems without logrotate: logrotate normally keeps the
+    latest 30 daily rotations (clipshare.log-YYYYMMDD.gz) and deletes older
+    ones, but if it is not configured this removes anything older than the
+    retention window. The active clipshare.log itself is never touched.
+    """
+    cutoff = time.time() - days * 86400
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(LOG_FILE_NAME) or name == LOG_FILE_NAME:
+            continue
+        path = os.path.join(log_dir, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def setup_logging(log_dir=None):
+    """Create the log dir, prune old logs, tee stdout/stderr into the log file.
+
+    Call once, right after parsing the CLI arguments, before anything else is
+    printed. ``log_dir`` defaults to LOG_DEFAULT_DIR (/var/log/clipshare); pass
+    an empty string to disable file logging entirely. When the default system
+    directory is not writable (e.g. a non-root manual run) it falls back to a
+    repo-local ``logs/`` directory so file logging still works.
+    """
+    if log_dir is None:
+        log_dir = LOG_DEFAULT_DIR
+    if not log_dir:
+        return
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError as e:
+        if log_dir == LOG_DEFAULT_DIR:
+            fallback = "logs"
+            try:
+                os.makedirs(fallback, exist_ok=True)
+            except OSError:
+                print(f"[!] Cannot create log dir {log_dir!r} nor {fallback!r}: {e}")
+                return
+            print(f"[!] {log_dir!r} not writable; using {fallback!r} instead.")
+            log_dir = fallback
+        else:
+            print(f"[!] Cannot create log dir {log_dir!r}: {e}")
+            return
+    _cleanup_old_logs(log_dir)
+    sys.stdout = _LogStream(sys.stdout, log_dir)
+    sys.stderr = _LogStream(sys.stderr, log_dir)
+
+
 def get_local_ip():
     """Best-effort detection of the LAN IP (no traffic is sent)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -107,27 +252,33 @@ def get_local_ip():
 
 # --------------------------- clipboard access ----------------------------- #
 class Clipboard:
-    """Thread-safe wrapper around pyperclip with loop prevention."""
+    """Thread-safe wrapper around the clipboard with loop prevention.
+
+    Uses pyperclip when a backend (xclip/xsel/wl-clipboard on Linux) is
+    available; otherwise falls back to the built-in X11 backend
+    (python-xlib) so copy/paste keeps working on Linux X11 out of the box.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._backend_ok = self._check_backend()
+        self._backend = self._detect_backend()
+        self._owner = None            # current X11 selection owner (if any)
         self._warn_printed = False
         try:
-            self.last_value = pyperclip.paste() if self._backend_ok else ""
+            self.last_value = self._paste() if self._backend else ""
         except Exception:
             self.last_value = ""
 
-    def _check_backend(self):
-        """Return True if pyperclip can actually find a copy/paste mechanism.
-        On Linux this requires xclip/xsel (X11) or wl-clipboard (Wayland)."""
+    def _detect_backend(self):
+        """Prefer pyperclip (external tools) and fall back to X11."""
         try:
             pyperclip.paste()
-            return True
-        except pyperclip.PyperclipException:
-            return False
+            return "pyperclip"
         except Exception:
-            return False
+            pass
+        if _x11_available():
+            return "x11"
+        return None
 
     def describe(self):
         return {
@@ -138,53 +289,64 @@ class Clipboard:
     def _warn_once(self):
         if not self._warn_printed:
             self._warn_printed = True
-            print("[!] No clipboard backend available on this system. "
-                  "Clipboard sharing will not work until one is installed:")
+            print("[!] No clipboard backend available on this system "
+                  "(no xclip/xsel/wl-clipboard and no X11 access). "
+                  "Clipboard sharing will not work.")
             print("      Linux X11   : sudo apt install xclip   (or xsel)")
             print("      Linux Wayland: sudo apt install wl-clipboard")
-            print("    Remote updates will be received but cannot be written locally.")
+
+    def _paste(self):
+        if self._backend == "x11":
+            return x11_paste_text()
+        if not self._backend:
+            return None
+        try:
+            return pyperclip.paste()
+        except Exception:
+            return None
+
+    def _copy(self, text):
+        if self._backend == "x11":
+            if self._owner:
+                self._owner.stop()
+            data = text.encode("utf-8")
+            self._owner = _X11SelectionOwner({
+                "UTF8_STRING": data,
+                "STRING": data,
+                "TEXT": data,
+                "text/plain": data,
+            })
+            return True
+        if not self._backend:
+            return False
+        try:
+            pyperclip.copy(text)
+            return True
+        except Exception:
+            return False
 
     def get(self):
         with self._lock:
-            if not self._backend_ok:
-                return None
-            try:
-                return pyperclip.paste()
-            except Exception:
-                return None
+            return self._paste()
 
     def set(self, text):
         """Set the clipboard AND record the value so the poller will not
         treat this remote write as a local change (prevents echo loops).
         Returns True on success, False if the write failed (e.g. no backend)."""
         with self._lock:
-            if not self._backend_ok:
+            ok = self._copy(text)
+            if not ok:
                 self._warn_once()
-                self.last_value = text  # still record it to avoid echo loops
-                return False
-            try:
-                pyperclip.copy(text)
-                self.last_value = text
-                return True
-            except pyperclip.PyperclipException:
-                self._backend_ok = False
-                self._warn_once()
-                self.last_value = text
-                return False
-            except Exception:
-                self.last_value = text
-                return False
+            self.last_value = text  # still record it to avoid echo loops
+            return ok
 
     def poll_changed(self):
         """Return the new local value if it changed since last seen, else None."""
         with self._lock:
-            if not self._backend_ok:
+            cur = self._paste()
+            if cur is None:
                 return None
-            try:
-                cur = pyperclip.paste()
-            except Exception:
-                return None
-            if cur != self.last_value and cur is not None:
+            if cur != self.last_value:
                 self.last_value = cur
                 return cur
             return None
@@ -217,6 +379,201 @@ def recv_frame(conn):
     return ftype, payload
 
 
+# ------------------- X11 native clipboard (python-xlib) ------------------ #
+# Built-in fallback for Linux X11 so the tool works even when xclip / xsel /
+# wl-clipboard are not installed. Talks to the X server through python-xlib
+# (pure Python, already present on many systems). All imports are lazy, so
+# Windows/macOS and Linux machines without python-xlib are unaffected.
+
+def _x11_available():
+    """True if python-xlib can open a connection to the X server."""
+    if not sys.platform.startswith("linux"):
+        return False
+    if not os.environ.get("DISPLAY"):
+        return False
+    try:
+        from Xlib import display  # noqa: F401
+    except Exception:
+        return False
+    try:
+        d = display.Display()
+    except Exception:
+        return False
+    try:
+        d.close()
+    except Exception:
+        pass
+    return True
+
+
+def x11_paste(targets):
+    """Request the CLIPBOARD data for the first available target.
+    `targets` is a tuple of target atom names (e.g. "UTF8_STRING").
+    Returns the raw bytes, or None when there is no data / no owner."""
+    from Xlib import X, display
+    try:
+        d = display.Display()
+    except Exception:
+        return None
+    w = None
+    try:
+        w = d.screen().root.create_window(
+            0, 0, 1, 1, 0, X.CopyFromParent, X.InputOutput)
+        sel = d.intern_atom("CLIPBOARD")
+        if not d.get_selection_owner(sel):
+            return None
+        prop = d.intern_atom("_CLIPSHARE_X11_PROP")
+        for tname in targets:
+            try:
+                target = d.intern_atom(tname)
+            except Exception:
+                continue
+            try:
+                w.delete_property(prop)
+            except Exception:
+                pass
+            w.convert_selection(sel, target, prop, X.CurrentTime)
+            d.flush()
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if d.pending_events():
+                    ev = d.next_event()
+                    if ev.type == X.SelectionNotify:
+                        if ev.property != X.NONE:
+                            pr = w.get_full_property(prop, X.AnyPropertyType)
+                            if pr is not None and pr.value:
+                                return bytes(pr.value)
+                        break
+                else:
+                    time.sleep(0.01)
+        return None
+    except Exception:
+        return None
+    finally:
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        try:
+            d.close()
+        except Exception:
+            pass
+
+
+class _X11SelectionOwner:
+    """Hold the X11 CLIPBOARD selection and answer SelectionRequest events.
+
+    Runs in its own daemon thread with a dedicated X connection so the
+    caller never blocks. The connection must stay open for the data to
+    remain pastable, so an owner lives until a newer one replaces it."""
+
+    def __init__(self, targets):
+        # targets: {atom_name(str): bytes}
+        from Xlib import X, display
+        self._d = display.Display()
+        self._w = self._d.screen().root.create_window(
+            0, 0, 1, 1, 0, X.CopyFromParent, X.InputOutput)
+        self._sel = self._d.intern_atom("CLIPBOARD")
+        self._targets = {self._d.intern_atom(k): v for k, v in targets.items()}
+        self._targets_atom = self._d.intern_atom("TARGETS")
+        self._running = threading.Event()
+        self._running.set()
+        self._w.set_selection_owner(self._sel, X.CurrentTime,
+                                    onerror=self._on_error)
+        self._d.flush()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        from Xlib import X, Xatom
+        old = self._d.set_error_handler(self._on_error)
+        try:
+            while self._running.is_set():
+                if self._d.pending_events():
+                    ev = self._d.next_event()
+                    if ev.type == X.SelectionRequest:
+                        self._handle(ev)
+                else:
+                    time.sleep(0.01)
+        finally:
+            self._d.set_error_handler(old)
+            try:
+                self._w.destroy()
+            except Exception:
+                pass
+            try:
+                self._d.close()
+            except Exception:
+                pass
+
+    def _handle(self, req):
+        from Xlib import X, Xatom
+        prop = req.property
+        if prop == X.NONE:
+            prop = req.target
+        data = self._targets.get(req.target)
+        try:
+            if req.target == self._targets_atom:
+                req.requestor.change_property(
+                    prop, Xatom.ATOM, 32,
+                    [self._targets_atom] + list(self._targets.keys()),
+                    onerror=self._on_error)
+            elif data is None:
+                self._reply(req, X.NONE)
+                return
+            else:
+                req.requestor.change_property(
+                    prop, req.target, 8, data, onerror=self._on_error)
+            self._d.flush()
+        except Exception:
+            self._reply(req, X.NONE)
+            return
+        self._reply(req, prop)
+
+    def _reply(self, req, prop):
+        from Xlib import X
+        from Xlib.protocol import event as pevent
+        try:
+            sev = pevent.SelectionNotify(
+                time=X.CurrentTime, requestor=req.requestor,
+                selection=req.selection, target=req.target, property=prop)
+            self._d.send_event(req.requestor, sev)
+            self._d.flush()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _on_error(*args):
+        pass
+
+    def stop(self):
+        self._running.clear()
+
+
+def x11_copy_text(text):
+    """Put `text` on the CLIPBOARD (X11). Returns True on success."""
+    data = text.encode("utf-8")
+    targets = {
+        "UTF8_STRING": data,
+        "STRING": data,
+        "TEXT": data,
+        "text/plain": data,
+    }
+    return bool(_X11SelectionOwner(targets))
+
+
+def x11_paste_text():
+    """Read clipboard text (X11). Returns str or None."""
+    data = x11_paste(("UTF8_STRING", "STRING", "TEXT", "text/plain"))
+    if data is None:
+        return None
+    try:
+        return data.decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
 # --------------------------- file clipboard ------------------------------- #
 class FileClipboard:
     """Detect files copied to the OS clipboard and place received files back
@@ -225,13 +582,16 @@ class FileClipboard:
 
     Cross-platform, best effort:
       - Windows : native CF_HDROP via ctypes.
-      - Linux   : xclip (X11) / wl-clipboard (Wayland) using the
+      - Linux   : xclip (X11) / wl-clipboard (Wayland) / built-in
+                  python-xlib (X11) using the
                   'x-special/gnome-copied-files' and 'text/uri-list' targets.
     On unsupported systems every method degrades to a harmless no-op.
     """
 
     def __init__(self):
         self.backend = self._detect_backend()
+        self._lock = threading.Lock()
+        self._owner = None            # current X11 selection owner (if any)
 
     @property
     def available(self):
@@ -242,6 +602,7 @@ class FileClipboard:
             "windows": "Windows native (CF_HDROP)",
             "x11": "Linux X11 (xclip)",
             "wayland": "Linux Wayland (wl-clipboard)",
+            "x11py": "Linux X11 (built-in python-xlib)",
         }.get(self.backend, "unavailable on this system")
 
     # -- backend detection ----------------------------------------------- #
@@ -257,40 +618,50 @@ class FileClipboard:
                 return "x11"
             if wayland and which("wl-paste"):
                 return "wayland"
+            if _x11_available():
+                return "x11py"
         return None
 
     # -- read: files currently copied ------------------------------------ #
     def get_files(self):
-        """Return a list of existing local file paths currently on the
-        clipboard, or None if there are none / it is unsupported."""
-        try:
-            if self.backend == "windows":
-                paths = self._win_get_files()
-            elif self.backend == "x11":
-                paths = self._uris_to_paths(self._xclip_get())
-            elif self.backend == "wayland":
-                paths = self._uris_to_paths(self._wl_get())
-            else:
+        """Return a list of existing local file/folder paths currently on
+        the clipboard, or None if there are none / it is unsupported."""
+        with self._lock:
+            try:
+                if self.backend == "windows":
+                    paths = self._win_get_files()
+                elif self.backend == "x11":
+                    paths = self._uris_to_paths(self._xclip_get())
+                elif self.backend == "wayland":
+                    paths = self._uris_to_paths(self._wl_get())
+                elif self.backend == "x11py":
+                    paths = self._uris_to_paths(self._x11py_get())
+                else:
+                    return None
+            except Exception:
                 return None
-        except Exception:
-            return None
-        files = [p for p in (paths or []) if os.path.isfile(p)]
-        return files or None
+            paths = [p for p in (paths or [])
+                     if os.path.isfile(p) or os.path.isdir(p)]
+            return paths or None
 
     # -- write: put files on the clipboard ------------------------------- #
     def set_files(self, paths):
-        paths = [os.path.abspath(p) for p in paths if os.path.isfile(p)]
+        paths = [os.path.abspath(p) for p in paths
+                 if os.path.isfile(p) or os.path.isdir(p)]
         if not paths:
             return False
-        try:
-            if self.backend == "windows":
-                return self._win_set_files(paths)
-            if self.backend == "x11":
-                return self._xclip_set(paths)
-            if self.backend == "wayland":
-                return self._wl_set(paths)
-        except Exception:
-            return False
+        with self._lock:
+            try:
+                if self.backend == "windows":
+                    return self._win_set_files(paths)
+                if self.backend == "x11":
+                    return self._xclip_set(paths)
+                if self.backend == "wayland":
+                    return self._wl_set(paths)
+                if self.backend == "x11py":
+                    return self._x11py_set(paths)
+            except Exception:
+                return False
         return False
 
     # -- uri <-> path helpers -------------------------------------------- #
@@ -373,6 +744,32 @@ class FileClipboard:
         except Exception:
             return False
 
+    # -- Linux X11 (built-in python-xlib) -------------------------------- #
+    @staticmethod
+    def _x11py_get():
+        for target in ("x-special/gnome-copied-files", "text/uri-list"):
+            data = x11_paste((target,))
+            if data:
+                return data.decode("utf-8", "replace")
+        return ""
+
+    def _x11py_set(self, paths):
+        gnome = self._paths_to_gnome(paths).encode("utf-8")
+        uri_list = "\n".join(
+            "file://" + urllib.parse.quote(os.path.abspath(p))
+            for p in paths) + "\n"
+        # Only expose file-specific targets. Adding text targets here would
+        # make the text poller treat the URI list as a local text change and
+        # echo it back to peers.
+        targets = {
+            "x-special/gnome-copied-files": gnome,
+            "text/uri-list": uri_list,
+        }
+        if self._owner:
+            self._owner.stop()
+        self._owner = _X11SelectionOwner(targets)
+        return True
+
     # -- Windows (CF_HDROP via ctypes) ----------------------------------- #
     @staticmethod
     def _win_get_files():
@@ -386,6 +783,7 @@ class FileClipboard:
             wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
         shell32.DragQueryFileW.restype = wintypes.UINT
         user32.GetClipboardData.restype = wintypes.HANDLE
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
 
         if not user32.OpenClipboard(None):
             return []
@@ -476,7 +874,8 @@ class ImageClipboard:
     Cross-platform, best effort:
       - Windows : native CF_DIB via ctypes (requires Pillow to convert).
       - Linux   : xclip (X11) / wl-clipboard (Wayland) using the
-                  'image/png' target.
+                  'image/png' target; when xclip is missing the built-in
+                  python-xlib backend ('x11py') is used on X11 instead.
     On unsupported systems (or when Pillow is missing on Windows) every method
     degrades to a harmless no-op and the image is saved as a PNG in recv_dir
     instead.
@@ -493,6 +892,7 @@ class ImageClipboard:
         return {
             "windows": "Windows native (CF_DIB)",
             "x11": "Linux X11 (xclip)",
+            "x11py": "Linux X11 (python-xlib)",
             "wayland": "Linux Wayland (wl-clipboard)",
         }.get(self.backend, "unavailable on this system")
 
@@ -508,6 +908,8 @@ class ImageClipboard:
                 return "x11"
             if wayland and which("wl-paste"):
                 return "wayland"
+            if _x11_available():
+                return "x11py"  # no xclip: fall back to the python-xlib backend
         return None
 
     @staticmethod
@@ -521,6 +923,8 @@ class ImageClipboard:
                 data = self._win_get_image()
             elif self.backend == "x11":
                 data = self._xclip_get_image()
+            elif self.backend == "x11py":
+                data = self._x11py_get_image()
             elif self.backend == "wayland":
                 data = self._wl_get_image()
             else:
@@ -538,6 +942,8 @@ class ImageClipboard:
                 return self._win_set_image(png)
             if self.backend == "x11":
                 return self._xclip_set_image(png)
+            if self.backend == "x11py":
+                return self._x11py_set_image(png)
             if self.backend == "wayland":
                 return self._wl_set_image(png)
         except Exception:
@@ -581,6 +987,20 @@ class ImageClipboard:
             return True
         except Exception:
             return False
+
+    # -- Linux X11 (python-xlib, no xclip needed) ------------------------- #
+    @staticmethod
+    def _x11py_get_image():
+        """Read clipboard image as PNG via python-xlib (target 'image/png')."""
+        data = x11_paste(("image/png", "PNG"))
+        if data and data[:8] == b"\x89PNG\r\n\x1a\n":
+            return data
+        return b""
+
+    def _x11py_set_image(self, png):
+        """Own the CLIPBOARD as an image/png owner using python-xlib."""
+        owner = _X11SelectionOwner({"image/png": png, "PNG": png})
+        return bool(owner)
 
     # -- Windows (CF_DIB via ctypes + Pillow) ----------------------------- #
     @staticmethod
@@ -811,6 +1231,7 @@ class PeerNet:
         threading.Thread(target=self._reader, args=(conn, peer_ip),
                          daemon=True).start()
         print(f"[+] Connected to {peer_ip}:{self.port}")
+        self._log_mesh_status()
         return True
 
     def _log_mesh_status(self):
@@ -969,6 +1390,7 @@ class PeerNet:
             except Exception:
                 pass
             print(f"[-] Disconnected from {peer_ip}")
+            self._log_mesh_status()
 
     # -- broadcast -------------------------------------------------------- #
     def broadcast(self, text):
@@ -1049,17 +1471,40 @@ class PeerNet:
             print(f"[<] Received file {os.path.basename(dest)!r} "
                   f"({len(data)} bytes) from {peer_ip} -> {dest}")
 
-    def _write_recv_file(self, name, data, peer_ip):
+    @staticmethod
+    def _safe_relpath(name):
+        """Sanitize a peer-supplied relative path (may contain sub-dirs) so
+        it stays inside the receive directory. Returns None if unsafe."""
+        name = name.replace("\\", "/").lstrip("/")
+        parts = []
+        for part in name.split("/"):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                return None
+            parts.append(part)
+        return "/".join(parts) or None
+
+    def _write_recv_file(self, name, data, peer_ip, allow_subdirs=False):
         """Write one received file into recv_dir; return the path or None.
-        The name is sanitized so a peer cannot escape the receive directory."""
-        safe_name = os.path.basename(name) or "received.bin"
+        The name is sanitized so a peer cannot escape the receive directory.
+        With allow_subdirs the name may be a relative path (sub-folders are
+        created); otherwise only the basename is kept."""
+        if allow_subdirs:
+            safe = self._safe_relpath(name)
+            if not safe:
+                print(f"[!] Refusing unsafe file path from {peer_ip}: {name!r}")
+                return None
+        else:
+            safe = os.path.basename(name) or "received.bin"
         try:
             os.makedirs(self.recv_dir, exist_ok=True)
         except OSError as e:
             print(f"[!] Cannot create recv dir {self.recv_dir!r}: {e}")
             return None
-        dest = self._unique_path(os.path.join(self.recv_dir, safe_name))
+        dest = self._unique_path(os.path.join(self.recv_dir, safe))
         try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "wb") as f:
                 f.write(data)
         except OSError as e:
@@ -1136,25 +1581,40 @@ class PeerNet:
                 print(f"[*] No image clipboard backend; saved to {dest}")
 
     def send_clip_files(self, paths):
-        """Send the given copied files to all peers as a single frame.
-        Returns the number of peers it reached."""
+        """Send the copied files/folders to all peers as a single frame.
+        Folders are walked recursively; relative paths preserve the tree
+        structure on the receiving side. Returns the number of peers reached."""
         blobs, total = [], 0
-        for p in paths:
-            try:
-                size = os.path.getsize(p)
-            except OSError:
+        for top in paths:
+            top_abs = os.path.abspath(top)
+            parent = os.path.dirname(top_abs)
+            if os.path.isfile(top_abs):
+                entries = [(os.path.basename(top_abs), top_abs)]
+            elif os.path.isdir(top_abs):
+                entries = []
+                for dirpath, dirnames, filenames in os.walk(top_abs):
+                    dirnames.sort()
+                    for fn in sorted(filenames):
+                        fpath = os.path.join(dirpath, fn)
+                        entries.append((os.path.relpath(fpath, parent), fpath))
+            else:
                 continue
-            total += size
-            if total > MAX_FILE_SIZE:
-                print(f"[!] Copied files exceed {MAX_FILE_SIZE} bytes; "
-                      f"not sending.")
-                return 0
-            try:
-                with open(p, "rb") as f:
-                    data = f.read()
-            except OSError:
-                continue
-            blobs.append((os.path.basename(p).encode("utf-8"), data))
+            for rel, fpath in entries:
+                try:
+                    size = os.path.getsize(fpath)
+                except OSError:
+                    continue
+                total += size
+                if total > MAX_FILE_SIZE:
+                    print(f"[!] Copied files exceed {MAX_FILE_SIZE} bytes; "
+                          f"not sending.")
+                    return 0
+                try:
+                    with open(fpath, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue
+                blobs.append((rel.encode("utf-8"), data))
         if not blobs:
             return 0
 
@@ -1197,7 +1657,8 @@ class PeerNet:
                 off += 8
                 data = payload[off:off + data_len]
                 off += data_len
-                dest = self._write_recv_file(name, data, peer_ip)
+                dest = self._write_recv_file(name, data, peer_ip,
+                                             allow_subdirs=True)
                 if dest:
                     saved.append(dest)
         except Exception as e:
@@ -1439,6 +1900,13 @@ def main():
 
     net.start()
 
+    # Stop cleanly when run as a service (systemd sends SIGTERM on stop).
+    signal.signal(signal.SIGTERM, _handle_signal)
+    try:
+        signal.signal(signal.SIGHUP, _handle_signal)
+    except (AttributeError, ValueError, OSError):
+        pass  # SIGHUP is unavailable on Windows.
+
     if args.send_file:
         print(f"[*] Will send file once a peer connects: {args.send_file}")
         threading.Thread(target=net.send_file_when_ready,
@@ -1465,6 +1933,7 @@ def main():
     next_file_poll = 0.0
     last_image_sig = None
     next_image_poll = 0.0
+    next_status_write = time.time() + 30.0
     try:
         while _running.is_set():
             changed = clip.poll_changed()
@@ -1498,6 +1967,12 @@ def main():
                     if sig != last_clip_files_sig and sig != net.recv_clip_sig():
                         last_clip_files_sig = sig
                         net.send_clip_files(files)
+
+            # Keep the status snapshot fresh for '--status' even when the
+            # mesh is stable (no connect/disconnect events to trigger a write).
+            if time.time() >= next_status_write:
+                next_status_write = time.time() + 30.0
+                net._write_status()
 
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
