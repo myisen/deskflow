@@ -46,6 +46,36 @@ python clipshare.py --password yourSecret --peer 192.168.1.40 --peer 192.168.1.5
 # （也支持逗号形式: --peer 192.168.1.50,192.168.1.60）
 ```
 
+### 对端管理与状态查询（运维命令）
+
+显式对端可以**持久化**到仓库内 `peers.conf`，守护进程启动时自动读取（与命令行 `--peer` 合并去重）；方便服务化部署后不改服务单元即可增删对端：
+
+```bash
+# 持久化添加 / 移除 / 查看对端（立即生效，下次启动守护进程时加载）
+python clipshare.py --peer-add 192.168.1.50
+python clipshare.py --peer-del 192.168.1.50
+python clipshare.py --peer-list
+```
+
+`--status` 在**不启动守护进程**的前提下输出单机状态：版本、本地 IP/端口、认证、配置的对端、各剪贴板后端，以及守护进程是否在运行（若在运行且状态快照新鲜，还会列出当前已连接的对端）：
+
+```bash
+python clipshare.py --status
+[*] clipshare v0.3
+[*] Local IP: 10.180.15.216  TCP port: 32620
+[*] Auth: off
+[*] Peers (peers.conf): 192.168.1.50
+[*] Text backend : Linux X11 (built-in python-xlib)
+[*] File backend : Linux X11 (built-in python-xlib)
+[*] Image backend: Linux X11 (python-xlib)
+[*] Daemon: running (pid 1234, snapshot 5s ago)
+[*] Mesh: connected to 2 peer(s): 192.168.1.50, 192.168.1.60
+[*] Log dir: '/var/log/clipshare'  Recv dir: /home/user/dev/clipshare/clipshare_recv
+```
+
+> 守护进程把运行状态快照写入仓库内 `clipshare.status`（每次组网变化时刷新，停止时删除），
+> `--status` 据此显示“运行中 + 已连接对端”；两者都被 .gitignore 忽略。
+
 ## 文件传输
 
 除了同步剪贴板文本，clipshare 还支持向所有已连接的对端发送**单个文件**。
