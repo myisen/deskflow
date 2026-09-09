@@ -63,9 +63,14 @@ import time
 import urllib.parse
 from shutil import which
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 import pyperclip
 
-__version__ = "0.3"
+__version__ = "0.4"
 
 # ----------------------------- configuration ------------------------------ #
 CLIP_PORT = 32620          # TCP port for clipboard transfer (binds 0.0.0.0)
@@ -117,6 +122,29 @@ else:
     LOG_DEFAULT_DIR = "/var/log/clipshare"
 LOG_FILE_NAME = "clipshare.log"          # active log file (logrotate rotates it)
 LOG_RETENTION_DAYS = 31       # delete rotated/old log files older than this
+
+# ----------------------------- config file --------------------------------- #
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.yaml")
+
+def _load_config():
+    """Load configuration from config.yaml (if it exists), then merge with
+    defaults. Returns a dict suitable for passing to parse_args() as defaults."""
+    cfg = {}
+    if not os.path.isfile(CONFIG_FILE):
+        return cfg
+    if yaml is None:
+        print(f"[!] config.yaml found but PyYAML is not installed. "
+              f"Install it: pip install pyyaml", file=sys.stderr)
+        return cfg
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        for k, v in raw.items():
+            if v is not None:
+                cfg[k] = v
+    except Exception as e:
+        print(f"[!] Failed to load {CONFIG_FILE}: {e}", file=sys.stderr)
+    return cfg
 
 
 class _LogStream:
@@ -270,7 +298,15 @@ class Clipboard:
             self.last_value = ""
 
     def _detect_backend(self):
-        """Prefer pyperclip (external tools) and fall back to X11."""
+        """Prefer pyperclip, fall back to Windows native or X11."""
+        # On Windows, try native ctypes first (more reliable than pyperclip
+        # which can fail with 'OpenClipboard Error 0' on transient busy).
+        if os.name == "nt":
+            try:
+                self._win_get_text()
+                return "win"
+            except Exception:
+                pass
         try:
             pyperclip.paste()
             return "pyperclip"
@@ -282,6 +318,7 @@ class Clipboard:
 
     def describe(self):
         return {
+            "win": "Windows native (CF_UNICODETEXT via ctypes)",
             "pyperclip": "pyperclip (external xclip/xsel/wl-clipboard)",
             "x11": "Linux X11 (built-in python-xlib)",
         }.get(self._backend, "unavailable on this system")
@@ -298,6 +335,8 @@ class Clipboard:
     def _paste(self):
         if self._backend == "x11":
             return x11_paste_text()
+        if self._backend == "win":
+            return self._win_get_text()
         if not self._backend:
             return None
         try:
@@ -317,6 +356,8 @@ class Clipboard:
                 "text/plain": data,
             })
             return True
+        if self._backend == "win":
+            return self._win_set_text(text)
         if not self._backend:
             return False
         try:
@@ -328,6 +369,19 @@ class Clipboard:
     def get(self):
         with self._lock:
             return self._paste()
+
+    def sync_last_value(self, text=None):
+        """Update last_value so the text poller won't detect a change.
+        If text is given, use it directly (e.g. empty string after
+        EmptyClipboard cleared the text format). Otherwise read from
+        the clipboard."""
+        with self._lock:
+            if text is not None:
+                self.last_value = text
+            else:
+                v = self._paste()
+                if v is not None:
+                    self.last_value = v
 
     def set(self, text):
         """Set the clipboard AND record the value so the poller will not
@@ -350,6 +404,82 @@ class Clipboard:
                 self.last_value = cur
                 return cur
             return None
+
+    # -- Windows native text clipboard (CF_UNICODETEXT via ctypes) --------- #
+    @staticmethod
+    def _win_get_text():
+        """Read Unicode text from the Windows clipboard.
+        Retries up to 3 times on transient OpenClipboard failures."""
+        import ctypes
+        from ctypes import wintypes
+        CF_UNICODETEXT = 13
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.GetClipboardData.restype = wintypes.HANDLE
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        for attempt in range(3):
+            if not user32.OpenClipboard(None):
+                time.sleep(0.05)
+                continue
+            try:
+                if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                    return ""
+                h = user32.GetClipboardData(CF_UNICODETEXT)
+                if not h:
+                    return ""
+                ptr = kernel32.GlobalLock(h)
+                if not ptr:
+                    return ""
+                try:
+                    text = ctypes.wstring_at(ptr)
+                finally:
+                    kernel32.GlobalUnlock(h)
+                return text
+            finally:
+                user32.CloseClipboard()
+        return ""
+
+    @staticmethod
+    def _win_set_text(text):
+        """Write Unicode text to the Windows clipboard.
+        Retries up to 3 times on transient OpenClipboard failures."""
+        import ctypes
+        from ctypes import wintypes
+        CF_UNICODETEXT = 13
+        GMEM_MOVEABLE = 0x0002
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        encoded = (text + "\0").encode("utf-16-le")
+        h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+        if not h:
+            return False
+        ptr = kernel32.GlobalLock(h)
+        if ptr:
+            ctypes.memmove(ptr, encoded, len(encoded))
+            kernel32.GlobalUnlock(h)
+        for attempt in range(3):
+            if not user32.OpenClipboard(None):
+                time.sleep(0.05)
+                continue
+            try:
+                user32.EmptyClipboard()
+                if not user32.SetClipboardData(CF_UNICODETEXT, h):
+                    return False
+                return True
+            finally:
+                user32.CloseClipboard()
+        return False
 
 
 # ----------------------------- frame codec -------------------------------- #
@@ -601,6 +731,7 @@ class FileClipboard:
         return {
             "windows": "Windows native (CF_HDROP)",
             "x11": "Linux X11 (xclip)",
+            "x11sel": "Linux X11 (xsel)",
             "wayland": "Linux Wayland (wl-clipboard)",
             "x11py": "Linux X11 (built-in python-xlib)",
         }.get(self.backend, "unavailable on this system")
@@ -614,8 +745,10 @@ class FileClipboard:
             wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
             if wayland and which("wl-paste") and which("wl-copy"):
                 return "wayland"
-            if which("xclip"):
+            if which("xclip") and os.environ.get("DISPLAY"):
                 return "x11"
+            if which("xsel") and os.environ.get("DISPLAY"):
+                return "x11sel"
             if wayland and which("wl-paste"):
                 return "wayland"
             if _x11_available():
@@ -632,6 +765,8 @@ class FileClipboard:
                     paths = self._win_get_files()
                 elif self.backend == "x11":
                     paths = self._uris_to_paths(self._xclip_get())
+                elif self.backend == "x11sel":
+                    paths = self._uris_to_paths(self._xsel_get())
                 elif self.backend == "wayland":
                     paths = self._uris_to_paths(self._wl_get())
                 elif self.backend == "x11py":
@@ -656,6 +791,8 @@ class FileClipboard:
                     return self._win_set_files(paths)
                 if self.backend == "x11":
                     return self._xclip_set(paths)
+                if self.backend == "x11sel":
+                    return self._xsel_set(paths)
                 if self.backend == "wayland":
                     return self._wl_set(paths)
                 if self.backend == "x11py":
@@ -720,6 +857,34 @@ class FileClipboard:
         except Exception:
             return False
 
+    # -- Linux X11 (xsel) ------------------------------------------------ #
+    # NOTE: xsel's -t/--selectionTimeout is a timeout in milliseconds, NOT a
+    # target type like xclip's -t. We cannot request specific target types
+    # with xsel, so we just read/write raw clipboard text. This works for
+    # file URI lists (text/uri-list) since most file managers also provide
+    # them as STRING/UTF8_STRING.
+    @staticmethod
+    def _xsel_get():
+        try:
+            out = subprocess.run(
+                ["xsel", "--clipboard", "--output"],
+                capture_output=True, timeout=5)
+        except Exception:
+            return ""
+        if out.returncode == 0 and out.stdout:
+            return out.stdout.decode("utf-8", "replace")
+        return ""
+
+    def _xsel_set(self, paths):
+        data = self._paths_to_gnome(paths).encode("utf-8")
+        try:
+            subprocess.run(
+                ["xsel", "--clipboard", "--input"],
+                input=data, timeout=5, check=False)
+            return True
+        except Exception:
+            return False
+
     # -- Linux Wayland (wl-clipboard) ------------------------------------ #
     @staticmethod
     def _wl_get():
@@ -747,7 +912,11 @@ class FileClipboard:
     # -- Linux X11 (built-in python-xlib) -------------------------------- #
     @staticmethod
     def _x11py_get():
-        for target in ("x-special/gnome-copied-files", "text/uri-list"):
+        # Try file-specific targets first, then fall back to STRING/UTF8_STRING
+        # for compatibility with clipboard owners that don't advertise the
+        # GNOME-specific targets but still provide file:// URIs as text.
+        for target in ("x-special/gnome-copied-files", "text/uri-list",
+                       "UTF8_STRING", "STRING"):
             data = x11_paste((target,))
             if data:
                 return data.decode("utf-8", "replace")
@@ -758,12 +927,18 @@ class FileClipboard:
         uri_list = "\n".join(
             "file://" + urllib.parse.quote(os.path.abspath(p))
             for p in paths) + "\n"
-        # Only expose file-specific targets. Adding text targets here would
-        # make the text poller treat the URI list as a local text change and
-        # echo it back to peers.
+        uri_data = uri_list.encode("utf-8")
+        # When we receive files from a peer and put them on the clipboard,
+        # we've already marked them as received via mark_clip_files(), so it's
+        # safe to expose the URI list as TEXT/STRING for paste compatibility.
+        # This allows paste of the file paths as text, which is what some
+        # applications expect.
         targets = {
             "x-special/gnome-copied-files": gnome,
-            "text/uri-list": uri_list,
+            "text/uri-list": uri_data,
+            "UTF8_STRING": uri_data,
+            "STRING": uri_data,
+            "TEXT": uri_data,
         }
         if self._owner:
             self._owner.stop()
@@ -892,6 +1067,7 @@ class ImageClipboard:
         return {
             "windows": "Windows native (CF_DIB)",
             "x11": "Linux X11 (xclip)",
+            "x11sel": "Linux X11 (xsel)",
             "x11py": "Linux X11 (python-xlib)",
             "wayland": "Linux Wayland (wl-clipboard)",
         }.get(self.backend, "unavailable on this system")
@@ -904,8 +1080,10 @@ class ImageClipboard:
             wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
             if wayland and which("wl-paste") and which("wl-copy"):
                 return "wayland"
-            if which("xclip"):
+            if which("xclip") and os.environ.get("DISPLAY"):
                 return "x11"
+            if which("xsel") and os.environ.get("DISPLAY"):
+                return "x11sel"
             if wayland and which("wl-paste"):
                 return "wayland"
             if _x11_available():
@@ -923,6 +1101,8 @@ class ImageClipboard:
                 data = self._win_get_image()
             elif self.backend == "x11":
                 data = self._xclip_get_image()
+            elif self.backend == "x11sel":
+                data = self._xsel_get_image()
             elif self.backend == "x11py":
                 data = self._x11py_get_image()
             elif self.backend == "wayland":
@@ -942,6 +1122,8 @@ class ImageClipboard:
                 return self._win_set_image(png)
             if self.backend == "x11":
                 return self._xclip_set_image(png)
+            if self.backend == "x11sel":
+                return self._xsel_set_image(png)
             if self.backend == "x11py":
                 return self._x11py_set_image(png)
             if self.backend == "wayland":
@@ -988,13 +1170,55 @@ class ImageClipboard:
         except Exception:
             return False
 
+    # -- Linux X11 (xsel) ------------------------------------------------ #
+    # NOTE: xsel has no --target flag, so we read/write raw clipboard data.
+    # For image/png this means we cannot set the target type, so the pasted
+    # data will be treated as STRING/UTF8_STRING rather than image/png.
+    # This is a known limitation of xsel - for full image support, use xclip.
+    @staticmethod
+    def _xsel_get_image():
+        try:
+            out = subprocess.run(
+                ["xsel", "--clipboard", "--output"],
+                capture_output=True, timeout=5)
+        except Exception:
+            return b""
+        return out.stdout if out.returncode == 0 else b""
+
+    def _xsel_set_image(self, png):
+        try:
+            subprocess.run(
+                ["xsel", "--clipboard", "--input"],
+                input=png, timeout=5, check=False)
+            return True
+        except Exception:
+            return False
+
     # -- Linux X11 (python-xlib, no xclip needed) ------------------------- #
     @staticmethod
     def _x11py_get_image():
-        """Read clipboard image as PNG via python-xlib (target 'image/png')."""
-        data = x11_paste(("image/png", "PNG"))
-        if data and data[:8] == b"\x89PNG\r\n\x1a\n":
-            return data
+        """Read clipboard image as PNG via python-xlib.
+
+        Tries multiple common image targets since different screenshot tools
+        use different formats: image/png (standard), image/bmp (some tools),
+        image/jpeg, image/tiff. The first valid PNG found is returned.
+        """
+        for target in ("image/png", "PNG", "image/bmp", "image/jpeg",
+                       "image/tiff", "image/x-bmp", "image/x-MS-bmp"):
+            data = x11_paste((target,))
+            if data and data[:8] == b"\x89PNG\r\n\x1a\n":
+                return data
+            # Some tools put the raw BMP data (starts with "BM").
+            if data and data[:2] == b"BM":
+                try:
+                    from PIL import Image
+                    import io as _io
+                    img = Image.open(_io.BytesIO(data))
+                    out = _io.BytesIO()
+                    img.save(out, "PNG")
+                    return out.getvalue()
+                except Exception:
+                    pass
         return b""
 
     def _x11py_set_image(self, png):
@@ -1137,10 +1361,10 @@ class PeerNet:
         self.recv_dir = recv_dir
         self.file_clip = None            # optional FileClipboard (set by main)
         self._clipfile_lock = threading.Lock()
-        self.last_recv_clip_sig = None   # sig of files we just placed on clipboard
+        self.last_recv_clip_sig = {}     # sender_ip -> sig of files we just placed on clipboard
         self.image_clip = None           # optional ImageClipboard (set by main)
         self._image_lock = threading.Lock()
-        self.last_recv_image_sig = None  # sig of image we just placed on clipboard
+        self.last_recv_image_sig = {}    # sender_ip -> sig of image we just placed on clipboard
         # SHA-256 of the password; None means "open" (no auth required).
         self._pw_hash = (hashlib.sha256(password.encode("utf-8")).digest()
                          if password else None)
@@ -1373,7 +1597,13 @@ class PeerNet:
                 if ftype == TYPE_CLIP:
                     text = payload.decode("utf-8", "replace")
                     self.clip.set(text)
-                    print(f"[<] Clipboard updated from {peer_ip}")
+                    # Forward to all other peers (full mesh support).
+                    self.broadcast(text, skip_ip=peer_ip)
+                    preview = text[:40].replace("\n", " ")
+                    if len(text) > 40:
+                        preview += "..."
+                    print(f"[<] Received text {len(text)} bytes from {peer_ip}: "
+                          f"'{preview}'")
                 elif ftype == TYPE_FILE:
                     self._save_file(payload, peer_ip)
                 elif ftype == TYPE_CLIPFILES:
@@ -1393,19 +1623,20 @@ class PeerNet:
             self._log_mesh_status()
 
     # -- broadcast -------------------------------------------------------- #
-    def broadcast(self, text):
+    def broadcast(self, text, skip_ip=None):
         data = build_frame(TYPE_CLIP, text.encode("utf-8"))
         with self._lock:
             peers = list(self.connections.items())
         if not peers:
             return
-        for _, sock in peers:
+        for ip, sock in peers:
+            if ip == skip_ip:
+                continue
             try:
                 sock.sendall(data)
             except Exception:
                 # The reader thread will clean up the dead socket.
                 pass
-        print(f"[>] Sent clipboard to {len(peers)} peer(s)")
 
     # -- single-file transfer -------------------------------------------- #
     def send_file(self, path):
@@ -1517,28 +1748,45 @@ class PeerNet:
     def _files_sig(paths):
         return tuple(sorted(os.path.abspath(p) for p in paths))
 
-    def mark_clip_files(self, paths):
+    def mark_clip_files(self, paths, sender_ip):
         """Record files we just put on the local clipboard, so the poller
         does not treat them as a fresh local copy and echo them back."""
         with self._clipfile_lock:
-            self.last_recv_clip_sig = self._files_sig(paths)
+            self.last_recv_clip_sig[sender_ip] = self._files_sig(paths)
 
     def recv_clip_sig(self):
         with self._clipfile_lock:
-            return self.last_recv_clip_sig
+            return set(self.last_recv_clip_sig.values())
+
+    def get_clip_files_sender(self, sig):
+        """Return the sender IP whose stored clip-files sig matches `sig`."""
+        with self._clipfile_lock:
+            for ip, s in self.last_recv_clip_sig.items():
+                if s == sig:
+                    return ip
+        return None
 
     # -- copy/paste of images (OS clipboard) ------------------------------ #
-    def mark_recv_image(self, png):
+    def mark_recv_image(self, png, sender_ip):
         with self._image_lock:
-            self.last_recv_image_sig = hashlib.md5(png).digest()
+            self.last_recv_image_sig[sender_ip] = hashlib.md5(png).digest()
 
     def recv_image_sig(self):
         with self._image_lock:
-            return self.last_recv_image_sig
+            return set(self.last_recv_image_sig.values())
 
-    def send_image(self, png):
+    def get_image_sender(self, sig):
+        """Return the sender IP whose stored image sig matches `sig`."""
+        with self._image_lock:
+            for ip, s in self.last_recv_image_sig.items():
+                if s == sig:
+                    return ip
+        return None
+
+    def send_image(self, png, skip_ip=None):
         """Send a copied image (PNG bytes) to all peers. Returns the number
-        of peers it reached (0 if none / too large)."""
+        of peers it reached (0 if none / too large). If skip_ip is given, that
+        peer is skipped (used when forwarding a message we received from it)."""
         if not png:
             return 0
         if len(png) > MAX_FILE_SIZE:
@@ -1550,40 +1798,43 @@ class PeerNet:
         if not peers:
             return 0
         sent = 0
-        for _, sock in peers:
+        for ip, sock in peers:
+            if ip == skip_ip:
+                continue
             try:
                 sock.sendall(frame)
                 sent += 1
             except Exception:
                 pass
-        print(f"[>] Sent image ({len(png)} bytes) to {sent} peer(s)")
         return sent
 
     def _save_image(self, payload, peer_ip):
         if not payload:
             return
-        print(f"[<] Received image ({len(payload)} bytes) from {peer_ip}")
+        print(f"[<] Received image ({len(payload)} bytes) from {peer_ip} "
+              f"[screenshot/picture from remote]")
         if self.image_clip and self.image_clip.available:
+            # Before set_image() calls EmptyClipboard() which clears the text
+            # format, update the text baseline to empty string so the text
+            # poller won't detect a "change" and echo empty text back to peers.
+            self.clip.sync_last_value("")
+            # Mark as received BEFORE placing on clipboard, so the image
+            # poller won't race with us and echo the image back to peers.
+            self.mark_recv_image(payload, peer_ip)
             if self.image_clip.set_image(payload):
-                self.mark_recv_image(payload)
-                # Keep the text baseline fresh so the text poller does not
-                # echo the (now empty/garbage) text target left behind.
-                try:
-                    v = self.clip.get()
-                    if v is not None:
-                        self.clip.last_value = v
-                except Exception:
-                    pass
-                print("[*] Image placed on clipboard - paste (Ctrl+V) to use it.")
+                print("[*] Image placed on local clipboard - paste (Ctrl+V) in any "
+                      "application to use the remote screenshot/picture")
         else:
             dest = self._write_recv_file("clipboard.png", payload, peer_ip)
             if dest:
                 print(f"[*] No image clipboard backend; saved to {dest}")
 
-    def send_clip_files(self, paths):
+    def send_clip_files(self, paths, skip_ip=None):
         """Send the copied files/folders to all peers as a single frame.
         Folders are walked recursively; relative paths preserve the tree
-        structure on the receiving side. Returns the number of peers reached."""
+        structure on the receiving side. Returns the number of peers reached.
+        If skip_ip is given, that peer is skipped (used when forwarding a
+        message we received from it)."""
         blobs, total = [], 0
         for top in paths:
             top_abs = os.path.abspath(top)
@@ -1631,7 +1882,9 @@ class PeerNet:
         if not peers:
             return 0
         sent = 0
-        for _, sock in peers:
+        for ip, sock in peers:
+            if ip == skip_ip:
+                continue
             try:
                 sock.sendall(frame)
                 sent += 1
@@ -1670,10 +1923,17 @@ class PeerNet:
               f"-> {self.recv_dir}")
         # Put them on our clipboard so they can be pasted straight away.
         if self.file_clip and self.file_clip.available:
+            # Mark as received BEFORE placing on clipboard, so the file
+            # poller won't race with us and echo the files back to peers.
+            self.mark_clip_files(saved, peer_ip)
             if self.file_clip.set_files(saved):
-                self.mark_clip_files(saved)
-                print("[*] Files placed on clipboard - paste (Ctrl+V) "
-                      "in your file manager to use them.")
+                # After set_files() calls EmptyClipboard() on Windows the
+                # text format is gone. Update the text baseline to prevent
+                # the text poller from detecting a "change" and echoing
+                # empty text back to all peers.
+                self.clip.sync_last_value("")
+                print("[*] Files placed on local clipboard - paste (Ctrl+V) in your "
+                      "file manager to use the remote files")
 
     @staticmethod
     def _unique_path(path):
@@ -1762,7 +2022,10 @@ def _read_status(port):
     return running, snapshot
 
 def _cmd_status(args):
+    config_file = CONFIG_FILE if os.path.isfile(CONFIG_FILE) else None
     print(f"[*] clipshare v{__version__}")
+    if config_file:
+        print(f"[*] Config: {config_file}")
     print(f"[*] Local IP: {get_local_ip()}  TCP port: {args.port}")
     print(f"[*] Auth: {'on (SHA-256)' if args.password else 'off'}")
     peers = _load_peers_conf()
@@ -1798,28 +2061,35 @@ def _cmd_status(args):
           f"Recv dir: {os.path.abspath(args.recv_dir)}")
 
 def main():
+    # Load config file first (CLI args override later).
+    cfg = _load_config()
+
     parser = argparse.ArgumentParser(description="LAN clipboard sharing")
     parser.add_argument("--peer", action="append", default=[],
                         help="Peer IP (repeatable; omit for auto-discovery). "
                              "Comma-separated values in one flag are also allowed.")
-    parser.add_argument("--port", type=int, default=CLIP_PORT,
-                        help=f"TCP port (default {CLIP_PORT}, binds 0.0.0.0)")
-    parser.add_argument("--password", "-P", default=os.environ.get("CLIPSHARE_PASSWORD"),
+    parser.add_argument("--port", type=int, default=cfg.get("port", CLIP_PORT),
+                        help=f"TCP port (default {cfg.get('port', CLIP_PORT)}, "
+                             f"binds 0.0.0.0)")
+    parser.add_argument("--password", "-P", default=cfg.get("password") or os.environ.get("CLIPSHARE_PASSWORD"),
                         help="Connection password (same on all nodes). "
                              "May also be set via CLIPSHARE_PASSWORD env var.")
     parser.add_argument("--send-file", "-f", metavar="PATH",
+                        default=cfg.get("send_file"),
                         help="Send a single file to all connected peers shortly "
                              "after startup, then keep running normally.")
-    parser.add_argument("--recv-dir", default=DEFAULT_RECV_DIR, metavar="DIR",
+    parser.add_argument("--recv-dir", default=cfg.get("recv_dir", DEFAULT_RECV_DIR), metavar="DIR",
                         help=f"Directory to store received files "
-                             f"(default: {DEFAULT_RECV_DIR}).")
+                             f"(default: {cfg.get('recv_dir', DEFAULT_RECV_DIR)}).")
     parser.add_argument("--no-file-clip", action="store_true",
+                        default=cfg.get("no_file_clip", False),
                         help="Disable copy/paste file syncing (copying files "
                              "in the file manager is otherwise mirrored to "
                              "peers, ready to paste).")
     parser.add_argument("--no-image", action="store_true",
+                        default=cfg.get("no_image", False),
                         help="Disable picture (clipboard image) syncing.")
-    parser.add_argument("--log-dir", default=None, metavar="DIR",
+    parser.add_argument("--log-dir", default=cfg.get("log_dir"), metavar="DIR",
                         help=f"Directory for the log file "
                              f"(default: {LOG_DEFAULT_DIR!r}, falling back to "
                              f"logs/ when not writable); pass an empty string "
@@ -1877,12 +2147,18 @@ def main():
     if args.send_file and not os.path.isfile(args.send_file):
         raise SystemExit(f"[!] --send-file: not a file: {args.send_file!r}")
 
-    # Persisted peers (peers.conf) + CLI --peer flags are merged.
-    peers = _load_peers_conf()
+    # Merge peers: config.yaml peers + peers.conf + CLI --peer flags.
+    peers = set()
+    cfg_peers = cfg.get("peers") or []
+    if isinstance(cfg_peers, list):
+        for p in cfg_peers:
+            if isinstance(p, str) and p.strip():
+                peers.add(p.strip())
+    for p in _load_peers_conf():
+        peers.add(p)
     for item in args.peer:
-        peers.extend(p.strip() for p in item.split(",") if p.strip())
-    seen = set()
-    peers = [p for p in peers if not (p in seen or seen.add(p))]
+        peers.update(p.strip() for p in item.split(",") if p.strip())
+    peers = sorted(peers)
 
     clip = Clipboard()
     net = PeerNet(args.port, peers, clip, password=args.password,
@@ -1929,6 +2205,11 @@ def main():
               "(received images are saved to recv_dir)")
     print("[*] Watching clipboard. Copy something to share it. Ctrl+C to quit.")
 
+    # Config-derived polling intervals (from config file or defaults).
+    poll_interval = cfg.get("poll_interval", POLL_INTERVAL)
+    file_poll_interval = cfg.get("file_poll_interval", FILE_POLL_INTERVAL)
+    image_poll_interval = cfg.get("image_poll_interval", IMAGE_POLL_INTERVAL)
+
     last_clip_files_sig = None
     next_file_poll = 0.0
     last_image_sig = None
@@ -1938,10 +2219,15 @@ def main():
         while _running.is_set():
             changed = clip.poll_changed()
             if changed is not None:
+                length = len(changed)
+                preview = changed[:40].replace("\n", " ")
+                if length > 40:
+                    preview += "..."
                 net.broadcast(changed)
+                print(f"[>] Sent text {length} bytes: '{preview}'")
 
             if image_clip and image_clip.available and time.time() >= next_image_poll:
-                next_image_poll = time.time() + IMAGE_POLL_INTERVAL
+                next_image_poll = time.time() + image_poll_interval
                 img = image_clip.get_image()
                 if img:
                     # While an image sits on the clipboard, keep the text
@@ -1951,22 +2237,39 @@ def main():
                     if v is not None:
                         clip.last_value = v
                     sig = hashlib.md5(img).digest()
-                    # Skip if unchanged, or if this is the image a peer just
-                    # pushed onto our clipboard (avoid echoing it back).
-                    if sig != last_image_sig and sig != net.recv_image_sig():
-                        last_image_sig = sig
-                        net.send_image(img)
+                    recv_sigs = net.recv_image_sig()
+                    if sig != last_image_sig:
+                        if sig not in recv_sigs:
+                            # New local image - broadcast to all peers
+                            last_image_sig = sig
+                            n = net.send_image(img)
+                            print(f"[>] Sent image ({len(img)} bytes) to {n} peer(s) "
+                                  f"[screenshot/picture detected]")
+                        else:
+                            # Received from a peer - forward to all other peers
+                            last_image_sig = sig
+                            sender_ip = net.get_image_sender(sig)
+                            n = net.send_image(img, skip_ip=sender_ip)
+                            if n:
+                                print(f"[>] Forwarded image ({len(img)} bytes) to {n} peer(s) "
+                                      f"[forwarded from {sender_ip}]")
 
             if file_clip and file_clip.available and time.time() >= next_file_poll:
-                next_file_poll = time.time() + FILE_POLL_INTERVAL
+                next_file_poll = time.time() + file_poll_interval
                 files = file_clip.get_files()
                 if files:
                     sig = PeerNet._files_sig(files)
-                    # Skip if unchanged, or if these are files a peer just
-                    # pushed onto our clipboard (avoid echoing them back).
-                    if sig != last_clip_files_sig and sig != net.recv_clip_sig():
-                        last_clip_files_sig = sig
-                        net.send_clip_files(files)
+                    recv_sigs = net.recv_clip_sig()
+                    if sig != last_clip_files_sig:
+                        if sig not in recv_sigs:
+                            # New local files - broadcast to all peers
+                            last_clip_files_sig = sig
+                            net.send_clip_files(files)
+                        else:
+                            # Received from a peer - forward to all other peers
+                            last_clip_files_sig = sig
+                            sender_ip = net.get_clip_files_sender(sig)
+                            net.send_clip_files(files, skip_ip=sender_ip)
 
             # Keep the status snapshot fresh for '--status' even when the
             # mesh is stable (no connect/disconnect events to trigger a write).
@@ -1974,7 +2277,7 @@ def main():
                 next_status_write = time.time() + 30.0
                 net._write_status()
 
-            time.sleep(POLL_INTERVAL)
+            time.sleep(poll_interval)
     except KeyboardInterrupt:
         pass
     finally:

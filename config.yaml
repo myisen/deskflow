@@ -1,0 +1,35 @@
+# =============================================================================
+# clipshare 配置文件
+# =============================================================================
+# 配置项优先级: CLI 参数 > config.yaml > 代码默认值
+# =============================================================================
+
+# --- 网络 ---
+port: 32620
+discovery_port: 54321
+password: ""
+
+# --- 对等节点 ---
+# peers:
+#   - 192.168.1.50
+
+# --- 功能开关 ---
+no_file_clip: false
+no_image: false
+
+# --- 轮询间隔 ---
+poll_interval: 0.3
+file_poll_interval: 1.0
+image_poll_interval: 0.5
+
+# --- 发现与重连 ---
+broadcast_interval: 2.0
+reconnect_interval: 3.0
+handshake_timeout: 5.0
+
+# --- 文件传输 ---
+# recv_dir: clipshare_recv
+# max_file_size: 2147483648
+
+# --- 日志 ---
+# log_retention_days: 31
