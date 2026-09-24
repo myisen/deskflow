@@ -1,9 +1,19 @@
+# Deskflow 打包产物（不纳入版本控制）
+appimage_stage/
+output/
+trixie/
+deb_x/
+
+# 应用镜像 / 归档
+*.AppImage
+*.squashfs
+*.tar.gz
+
+# 运行时/日志/状态
+logs/
+*.status
+peers.conf
+
+# Python __pycache__
 __pycache__/
 *.pyc
-*.pyo
-.DS_Store
-clipshare-*.tar.gz
-clipshare_recv/
-clipshare.status
-logs/
-peers.conf
